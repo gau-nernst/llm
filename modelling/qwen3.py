@@ -7,8 +7,8 @@ import torch
 from torch import Tensor, nn
 from transformers import Qwen3Config
 
-from attn import attention
-from utils import load_hf_state_dict
+from .attn import attention
+from .utils import load_hf_state_dict
 
 
 # NOTE: if x and pos_embeds are BF16, the computation is done in BF16

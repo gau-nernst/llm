@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM
 
-from internvl import IMG_CONTEXT_ID, IMG_END_ID, IMG_START_ID, InternVLChatModel
+from modelling.internvl import IMG_CONTEXT_ID, IMG_END_ID, IMG_START_ID, InternVLChatModel
 
 
 def test_internvl():

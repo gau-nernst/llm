@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM
 
-from qwen3 import Qwen3ForCausalLM
+from modelling.qwen3 import Qwen3ForCausalLM
 
 
 def test_qwen3():

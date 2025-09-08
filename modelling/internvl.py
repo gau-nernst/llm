@@ -5,9 +5,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers import InternVLConfig, InternVLVisionConfig, Qwen3Config
 
-from attn import attention
-from qwen3 import Qwen3ForCausalLM
-from utils import load_hf_state_dict
+from .attn import attention
+from .qwen3 import Qwen3ForCausalLM
+from .utils import load_hf_state_dict
 
 IMG_START_ID = 151669  # <img>
 IMG_END_ID = 151670  # </img>
