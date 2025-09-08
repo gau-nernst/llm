@@ -1,4 +1,4 @@
-# https://github.com/OpenGVLab/InternVL/blob/eecca2aa/internvl_chat/internvl/model/internvl_chat/modeling_intern_vit.py
+# https://github.com/OpenGVLab/InternVL/blob/eecca2aa/internvl_chat/internvl/model/internvl_chat
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +8,10 @@ from transformers import InternVLConfig, InternVLVisionConfig, Qwen3Config
 from attn import attention
 from qwen3 import Qwen3ForCausalLM
 from utils import load_hf_state_dict
+
+IMG_START_ID = 151669  # <img>
+IMG_END_ID = 151670  # </img>
+IMG_CONTEXT_ID = 151671  # <IMG_CONTEXT>
 
 
 class InternAttention(nn.Module):
@@ -137,14 +141,12 @@ class InternVLChatModel(nn.Module):
             nn.Linear(llm_dim, llm_dim),
         )
 
-    def forward(
-        self, pixel_values: Tensor, input_ids: Tensor, *, pos_ids: Tensor | None = None, img_token_id: int = 151667
-    ) -> Tensor:
+    def forward(self, pixel_values: Tensor, input_ids: Tensor, *, pos_ids: Tensor | None = None) -> Tensor:
         # vision encoder, pixel (un)shuffle, and MLP projection
         vit_embeds = self.vision_model(pixel_values)
         imgH, img_W = pixel_values.shape[2:]
-        vit_patch_size = self.config.vision_config.patch_size
-        vit_embeds = vit_embeds.unflatten(1, (imgH // vit_patch_size, img_W // vit_patch_size))
+        vit_patch_size = self.config.vision_config.patch_size  # assume HW order
+        vit_embeds = vit_embeds.unflatten(1, (imgH // vit_patch_size[0], img_W // vit_patch_size[1]))
         vit_embeds = pixel_shuffle(vit_embeds, patch_size=self.downsample)
         vit_embeds = vit_embeds.flatten(1, 2)
         vit_embeds = self.mlp1(vit_embeds)
@@ -152,10 +154,10 @@ class InternVLChatModel(nn.Module):
         input_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # replace <IMG_CONTEXT> token with image embeddings
-        img_tokens_mask = input_ids == img_token_id
-        input_embeds = input_embeds.masked_fill(img_tokens_mask.unsqueeze(-1), vit_embeds)
+        input_embeds = input_embeds.clone()
+        input_embeds[input_ids == IMG_CONTEXT_ID] = vit_embeds
 
-        return self.language_model(inputs_embeds=input_embeds, pos_ids=pos_ids)
+        return self.language_model(input_embeds=input_embeds, pos_ids=pos_ids)
 
     @staticmethod
     def from_pretrained(model_id: str):
