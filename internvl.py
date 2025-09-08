@@ -152,10 +152,13 @@ class InternVLChatModel(nn.Module):
         vit_embeds = self.mlp1(vit_embeds)
 
         input_embeds = self.language_model.model.embed_tokens(input_ids)
+        B, L, _ = input_embeds.shape
 
         # replace <IMG_CONTEXT> token with image embeddings
-        input_embeds = input_embeds.clone()
-        input_embeds[input_ids == IMG_CONTEXT_ID] = vit_embeds
+        # doesn't seem to be very elegant
+        input_embeds = input_embeds.flatten(0, 1).clone()
+        input_embeds[input_ids.flatten() == IMG_CONTEXT_ID] = vit_embeds.flatten(0, 1)
+        input_embeds = input_embeds.reshape(B, L, -1)
 
         return self.language_model(input_embeds=input_embeds, pos_ids=pos_ids)
 
