@@ -111,12 +111,13 @@ class Qwen3Model(nn.Module):
         input_embeds: Tensor | None = None,
         pos_ids: Tensor | None = None,
     ) -> Tensor:
-        if pos_ids is None:
-            pos_ids = torch.arange(input_ids.shape[-1], device=input_ids.device)
-        pos_embeds = compute_rope(pos_ids, self.cfg.rope_theta, self.cfg.head_dim)
-        # pos_embeds = pos_embeds.to(self.embed_tokens.weight.dtype)
-
         hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+
+        if pos_ids is None:
+            pos_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+        pos_embeds = compute_rope(pos_ids, self.cfg.rope_theta, self.cfg.head_dim)
+        # pos_embeds = pos_embeds.to(hidden_states.dtype)
+
         for layer in self.layers:
             hidden_states = layer(hidden_states, pos_embeds)
         hidden_states = self.norm(hidden_states)

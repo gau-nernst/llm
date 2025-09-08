@@ -16,5 +16,10 @@ def test_qwen3():
     with torch.no_grad():
         out = model(input_ids)
         out_ref = model_ref(input_ids).logits
+    torch.testing.assert_close(out, out_ref, rtol=1e-4, atol=1e-4)
 
+    input_embeds = torch.randn(1, 16, model.cfg.hidden_size, device=device)
+    with torch.no_grad():
+        out = model(input_embeds=input_embeds)
+        out_ref = model_ref(inputs_embeds=input_embeds).logits
     torch.testing.assert_close(out, out_ref, rtol=1e-4, atol=1e-4)
