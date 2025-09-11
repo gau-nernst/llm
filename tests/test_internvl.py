@@ -1,5 +1,6 @@
 import torch
 from transformers import AutoModelForCausalLM
+from utils import check_close
 
 from modelling.internvl import IMG_CONTEXT_ID, IMG_END_ID, IMG_START_ID, InternVLChatModel
 
@@ -49,10 +50,4 @@ def test_internvl():
         out_ref = model_ref(img, input_ids, image_flags=image_flags).logits
 
     # difference is too much...
-    rtol = 1e-3
-    atol = 1e-3
-    tol = out_ref.float().abs() * rtol + atol
-    diff = (out.float() - out_ref.float()).abs()
-    mismatch = diff > tol
-    mismatch_pct = mismatch.float().mean().item()
-    assert mismatch_pct < 1e-4  # 0.01%
+    check_close(out, out_ref, rtol=1e-3, atol=1e-3, pct=1e-4)

@@ -52,4 +52,5 @@ def attention(
         ).transpose(1, 2)
         if to_squeeze:
             out = out[0]
+
     return out

@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 from transformers import Qwen3Config
 
-from .attn import attention
+from .attn import VarlenInfo, attention
 from .utils import load_hf_state_dict
 
 
@@ -52,14 +52,14 @@ class Qwen3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
-    def forward(self, x: Tensor, pos_embeds: Tensor) -> Tensor:
+    def forward(self, x: Tensor, pos_embeds: Tensor, varlen_info: VarlenInfo | None = None) -> Tensor:
         hidden_shape = (*x.shape[:-1], -1, self.head_dim)
         q = apply_rope(self.q_norm(self.q_proj(x).view(hidden_shape)), pos_embeds)
         k = apply_rope(self.k_norm(self.k_proj(x).view(hidden_shape)), pos_embeds)
         v = self.v_proj(x).view(hidden_shape)
 
         dropout_p = self.attention_dropout if self.training else 0.0
-        out = attention(q, k, v, is_causal=True, dropout_p=dropout_p)
+        out = attention(q, k, v, varlen_info=varlen_info, is_causal=True, dropout_p=dropout_p)
         out = self.o_proj(out.flatten(-2))
         return out
 
@@ -84,8 +84,8 @@ class Qwen3DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.mlp = Qwen3MLP(cfg)
 
-    def forward(self, x: Tensor, pos_embeds: Tensor) -> Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), pos_embeds)
+    def forward(self, x: Tensor, pos_embeds: Tensor, varlen_info: VarlenInfo | None = None) -> Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), pos_embeds, varlen_info)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -110,16 +110,17 @@ class Qwen3Model(nn.Module):
         *,
         input_embeds: Tensor | None = None,
         pos_ids: Tensor | None = None,
+        varlen_info: VarlenInfo | None = None,  # if this is present, pos_ids is redundant?
     ) -> Tensor:
         hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
 
         if pos_ids is None:
-            pos_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+            pos_ids = torch.arange(hidden_states.shape[-2], device=hidden_states.device)
         pos_embeds = compute_rope(pos_ids, self.cfg.rope_theta, self.cfg.head_dim)
         # pos_embeds = pos_embeds.to(hidden_states.dtype)
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, pos_embeds)
+            hidden_states = layer(hidden_states, pos_embeds, varlen_info)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -137,8 +138,14 @@ class Qwen3ForCausalLM(nn.Module):
         *,
         input_embeds: Tensor | None = None,
         pos_ids: Tensor | None = None,
+        varlen_info: VarlenInfo | None = None,
     ) -> Tensor:
-        hidden_states = self.model(input_ids, input_embeds=input_embeds, pos_ids=pos_ids)
+        hidden_states = self.model(
+            input_ids,
+            input_embeds=input_embeds,
+            pos_ids=pos_ids,
+            varlen_info=varlen_info,
+        )
         logits = self.lm_head(hidden_states)
         return logits
 
