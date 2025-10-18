@@ -23,7 +23,7 @@ from transformers import Qwen3Config
 from data import HFTextDataset
 from hellaswag import evaluate_hellaswag
 from modelling import Qwen3ForCausalLM
-from train_utils import LRSchedule, get_grad_norm, get_optimizer, print_model_stats
+from train_utils import LRSchedule, compute_flop, get_gpu_tflops, get_grad_norm, get_optimizer, print_model_stats
 
 
 def get_loss(model: Qwen3ForCausalLM, tokens: Tensor, labels: Tensor):
@@ -61,6 +61,10 @@ def main(args: argparse.Namespace):
         model = Qwen3ForCausalLM(cfg)
     model.model.compute_dtype = torch.bfloat16
 
+    flop_per_sample = compute_flop(model, args.seqlen, cfg.num_hidden_layers, cfg.num_attention_heads, cfg.head_dim)
+    flop_per_train_step = flop_per_sample * args.batch_size
+    gpu_tflops = get_gpu_tflops()
+
     if is_ddp:
         # initialize model on rank 0, then DDP will broadcast to other ranks
         model.to_empty(device="cuda")
@@ -91,7 +95,7 @@ def main(args: argparse.Namespace):
     else:
         lr_schedule = None
 
-    ds = HFTextDataset(tokenizer=args.model, seq_len=args.seq_len, eval=False, **args.train_ds)
+    ds = HFTextDataset(tokenizer=args.model, seqlen=args.seqlen, eval=False, **args.train_ds)
     forward_bsize = args.batch_size // (args.gradient_accumulation * world_size)
     dloader = StatefulDataLoader(
         ds,
@@ -126,7 +130,7 @@ def main(args: argparse.Namespace):
     pbar = tqdm(total=args.n_steps, initial=step, dynamic_ncols=True, disable=not is_master)
     model.train()
     loss_fn = get_loss if is_fsdp else torch.compile(get_loss)
-    time0 = time.time()
+    time0 = time.perf_counter()
     if args.profile and is_master:
         torch._inductor.config.triton.unique_kernel_names = True
         prof = torch.profiler.profile()
@@ -170,13 +174,16 @@ def main(args: argparse.Namespace):
             prof.start()
 
         if step % log_interval == 0 and is_master:
-            tokens_per_batch = args.batch_size * args.seq_len
-            time1 = time.time()
+            tokens_per_batch = args.batch_size * args.seqlen
+            time1 = time.perf_counter()
             log_dict = dict(
-                max_memory_allocated=torch.cuda.max_memory_allocated(),
+                max_memory_allocated_gb=torch.cuda.max_memory_allocated() / 1e9,
                 num_tokens_seen_millions=tokens_per_batch * step / 1e6,
                 tokens_per_second=tokens_per_batch * log_interval / (time1 - time0),
+                tflops=flop_per_train_step * log_interval / (time1 - time0) * 1e-12,
             )
+            if gpu_tflops != 0:
+                log_dict["mfu"] = log_dict["tflops"] / gpu_tflops
             time0 = time1
             logger.log(log_dict, step=step)
 
@@ -221,7 +228,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_ds", type=json.loads, required=True)
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
 
     parser.add_argument("--optim", default="torch.optim.AdamW")

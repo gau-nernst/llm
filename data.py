@@ -17,12 +17,12 @@ class HFTextDataset(IterableDataset):
         subset: str,
         split: str,
         tokenizer: str,
-        seq_len: int,
+        seqlen: int,
         eval: bool,
     ) -> None:
         self.ds = load_dataset(dataset, name=subset, split=split, streaming=True).select_columns("text")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-        self.seq_len = seq_len
+        self.seqlen = seqlen
         self.eval = eval
 
         if dist.is_initialized():
@@ -41,7 +41,7 @@ class HFTextDataset(IterableDataset):
         if worker_info is not None:
             assert worker_info.num_workers == 1
 
-        SAMPLE_LEN = self.seq_len + 1
+        SAMPLE_LEN = self.seqlen + 1
         while True:
             self.ds.set_epoch(self._epoch)
             for sample in self.ds:

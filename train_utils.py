@@ -4,6 +4,27 @@ import torch
 from torch import Tensor, nn
 
 
+# https://github.com/pytorch/torchtitan/blob/v0.2.0/torchtitan/models/utils.py#L363
+def compute_flop(model: nn.Module, seqlen: int, num_layers: int, num_heads: int, head_dim: int):
+    linear_params = sum(m.weight.numel() for m in model.modules() if isinstance(m, nn.Linear))
+    linear_flop = 2 * seqlen * linear_params
+    attn_flop = 4 * num_layers * num_heads * head_dim * seqlen * seqlen
+
+    # every matmul in forward needs 2 matmul in backward
+    return 3 * (linear_flop + attn_flop)
+
+
+def get_gpu_tflops():
+    name = torch.cuda.get_device_name()
+    lookup = {
+        "5090": 240,
+    }
+    for k, v in lookup.items():
+        if k in name.lower():
+            return v
+    return 0
+
+
 @torch.no_grad()
 def get_grad_norm(model: nn.Module):
     grad_norm_sq = sum(p.grad.square().sum() for p in model.parameters() if p.grad is not None)
