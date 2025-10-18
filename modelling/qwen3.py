@@ -1,7 +1,8 @@
 # https://github.com/huggingface/transformers/blob/v4.54.0/src/transformers/models/qwen3/modeling_qwen3.py
-# NOTE: there are 2 key differences in numerics in this implementation
+# NOTE: there are 3 key differences in numerics in this implementation
 # - we use nn.RMSNorm, which does multiplication in FP32, while Qwen3RMSNorm does it in BF16.
 # - we perform RoPE in FP32.
+# - qkv and gate/up are merged.
 
 import torch
 from torch import Tensor, nn
