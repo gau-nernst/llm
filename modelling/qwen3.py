@@ -8,20 +8,8 @@ from torch import Tensor, nn
 from transformers import Qwen3Config
 
 from .attn import VarlenInfo, attention
+from .rope import apply_rope, compute_rope
 from .utils import load_hf_state_dict
-
-
-# NOTE: if x and pos_embeds are BF16, the computation is done in BF16
-def apply_rope(x: Tensor, pos_embeds: Tensor) -> Tensor:
-    # x: [*, L, num_heads, dim]
-    # pos_embeds: [*, L, dim]
-    # pos_embeds may have fewer leading dimensions than x's
-    x1, x2 = x.chunk(2, dim=-1)
-    cos, sin = pos_embeds.unsqueeze(-2).chunk(2, dim=-1)
-
-    o1 = x1 * cos - x2 * sin
-    o2 = x1 * sin + x2 * cos
-    return torch.cat([o1, o2], dim=-1).to(x.dtype)
 
 
 class Qwen3Attention(nn.Module):
@@ -29,28 +17,14 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.head_dim = cfg.head_dim
         self.attention_dropout = cfg.attention_dropout
-        self.q_proj = nn.Linear(
-            cfg.hidden_size,
-            cfg.num_attention_heads * self.head_dim,
-            bias=cfg.attention_bias,
-        )
-        self.k_proj = nn.Linear(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * self.head_dim,
-            bias=cfg.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * self.head_dim,
-            bias=cfg.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            cfg.num_attention_heads * self.head_dim,
-            cfg.hidden_size,
-            bias=cfg.attention_bias,
-        )
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        qo_dim = cfg.num_attention_heads * cfg.head_dim
+        kv_dim = cfg.num_key_value_heads * cfg.head_dim
+        self.q_proj = nn.Linear(cfg.hidden_size, qo_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.hidden_size, kv_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.hidden_size, kv_dim, bias=False)
+        self.o_proj = nn.Linear(qo_dim, cfg.hidden_size, bias=False)
+        self.q_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
 
     def forward(self, x: Tensor, pos_embeds: Tensor, varlen_info: VarlenInfo | None = None) -> Tensor:
         hidden_shape = (*x.shape[:-1], -1, self.head_dim)
@@ -88,12 +62,6 @@ class Qwen3DecoderLayer(nn.Module):
         x = x + self.self_attn(self.input_layernorm(x), pos_embeds, varlen_info)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
-
-
-def compute_rope(pos_ids: Tensor, rope_theta: float, dim: int) -> Tensor:
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float, device=pos_ids.device) / dim))
-    freqs = pos_ids.unsqueeze(-1) * inv_freq
-    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)  # [*pos_ids.shape, dim]
 
 
 class Qwen3Model(nn.Module):
