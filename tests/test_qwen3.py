@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, Qwen3Config
 from utils import check_close
 
 from modelling.attn import VarlenInfo
@@ -61,3 +61,14 @@ def test_qwen3_varlen():
         out_ref = torch.cat([model(tokens_) for tokens_ in tokens_list], dim=0)
 
     check_close(out, out_ref, rtol=1e-1, atol=1e-2, pct=1e-2)
+
+
+def test_qwen3_tie_embeddings():
+    model_id = "Qwen/Qwen3-0.6B"
+
+    cfg = Qwen3Config.from_pretrained(model_id)
+    model = Qwen3ForCausalLM(cfg)
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+
+    model = Qwen3ForCausalLM.from_pretrained(model_id)
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()

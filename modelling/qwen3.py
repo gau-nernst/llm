@@ -107,12 +107,27 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
+def load_state_dict_hook(module, incompatible_keys):
+    if not module.cfg.tie_word_embeddings:
+        return
+
+    if "lm_head.weight" in incompatible_keys.missing_keys:
+        incompatible_keys.missing_keys.remove("lm_head.weight")
+    module.maybe_tie_embeddings()
+
+
 class Qwen3ForCausalLM(nn.Module):
     def __init__(self, cfg: Qwen3Config) -> None:
         super().__init__()
         self.cfg = cfg
         self.model = Qwen3Model(cfg)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.maybe_tie_embeddings()
+        self.register_load_state_dict_post_hook(load_state_dict_hook)
+
+    def maybe_tie_embeddings(self):
+        if self.cfg.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
