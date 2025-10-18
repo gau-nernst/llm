@@ -72,3 +72,19 @@ def test_qwen3_tie_embeddings():
 
     model = Qwen3ForCausalLM.from_pretrained(model_id)
     assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+
+
+def test_qwen3_autocast():
+    model_id = "Qwen/Qwen3-0.6B"
+    dtype = torch.bfloat16
+
+    cfg = Qwen3Config.from_pretrained(model_id)
+    model = Qwen3ForCausalLM(cfg)
+    model.model.compute_dtype = dtype
+
+    max_id = model.cfg.vocab_size - 1000
+    input_ids = torch.randint(0, max_id, size=(2, 16))
+    out = model(input_ids)
+
+    assert model.lm_head.weight.dtype == torch.float32
+    assert out.dtype == torch.bfloat16

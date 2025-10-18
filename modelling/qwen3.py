@@ -10,17 +10,7 @@ from transformers import Qwen3Config
 
 from .attn import VarlenInfo, attention
 from .rope import apply_rope, compute_rope
-from .utils import load_hf_state_dict
-
-
-def make_merge_hook(old_keys: list[str], new_key: str):
-    def hook(module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        if f"{prefix}{old_keys[0]}_proj.weight" not in state_dict:
-            return
-        w_list = [state_dict.pop(f"{prefix}{key}_proj.weight") for key in old_keys]
-        state_dict[f"{prefix}{new_key}_proj.weight"] = torch.cat(w_list, dim=0)
-
-    return hook
+from .utils import Linear, RMSNorm, load_hf_state_dict, make_merge_hook
 
 
 class Qwen3Attention(nn.Module):
@@ -33,10 +23,10 @@ class Qwen3Attention(nn.Module):
         qo_dim = cfg.num_attention_heads * cfg.head_dim
         kv_dim = cfg.num_key_value_heads * cfg.head_dim
 
-        self.qkv_proj = nn.Linear(cfg.hidden_size, qo_dim + kv_dim * 2, bias=False)
-        self.o_proj = nn.Linear(qo_dim, cfg.hidden_size, bias=False)
-        self.q_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
+        self.qkv_proj = Linear(cfg.hidden_size, qo_dim + kv_dim * 2, bias=False)
+        self.o_proj = Linear(qo_dim, cfg.hidden_size, bias=False)
+        self.q_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.register_load_state_dict_pre_hook(make_merge_hook(["q", "k", "v"], "qkv"))
 
     def forward(self, x: Tensor, pos_embeds: Tensor, varlen_info: VarlenInfo | None = None) -> Tensor:
@@ -54,8 +44,8 @@ class Qwen3Attention(nn.Module):
 class Qwen3MLP(nn.Module):
     def __init__(self, cfg: Qwen3Config) -> None:
         super().__init__()
-        self.gate_up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size * 2, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+        self.gate_up_proj = Linear(cfg.hidden_size, cfg.intermediate_size * 2, bias=False)
+        self.down_proj = Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
         self.act_fn = nn.SiLU()
         self.register_load_state_dict_pre_hook(make_merge_hook(["gate", "up"], "gate_up"))
 
@@ -67,9 +57,9 @@ class Qwen3MLP(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, cfg: Qwen3Config) -> None:
         super().__init__()
-        self.input_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.self_attn = Qwen3Attention(cfg)
-        self.post_attention_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.mlp = Qwen3MLP(cfg)
 
     def forward(self, x: Tensor, pos_embeds: Tensor, varlen_info: VarlenInfo | None = None) -> Tensor:
@@ -79,12 +69,13 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, cfg: Qwen3Config) -> None:
+    def __init__(self, cfg: Qwen3Config, compute_dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.cfg = cfg
+        self.compute_dtype = compute_dtype
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, cfg.pad_token_id)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)])
-        self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     def forward(
         self,
@@ -95,6 +86,7 @@ class Qwen3Model(nn.Module):
         varlen_info: VarlenInfo | None = None,  # if this is present, pos_ids is redundant?
     ) -> Tensor:
         hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        hidden_states = hidden_states.to(self.compute_dtype)
 
         if pos_ids is None:
             pos_ids = torch.arange(hidden_states.shape[-2], device=hidden_states.device)
@@ -117,11 +109,11 @@ def load_state_dict_hook(module, incompatible_keys):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    def __init__(self, cfg: Qwen3Config) -> None:
+    def __init__(self, cfg: Qwen3Config, compute_dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.cfg = cfg
-        self.model = Qwen3Model(cfg)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.model = Qwen3Model(cfg, compute_dtype)
+        self.lm_head = Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.maybe_tie_embeddings()
         self.register_load_state_dict_post_hook(load_state_dict_hook)
 
