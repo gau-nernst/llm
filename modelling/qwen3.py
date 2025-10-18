@@ -3,8 +3,10 @@
 # - we use nn.RMSNorm, which does multiplication in FP32, while Qwen3RMSNorm does it in BF16.
 # - we perform RoPE in FP32.
 # - qkv and gate/up are merged.
+# init weights logic follows torchtitan
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers import Qwen3Config
 
@@ -29,6 +31,12 @@ class Qwen3Attention(nn.Module):
         self.k_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.register_load_state_dict_pre_hook(make_merge_hook(["q", "k", "v"], "qkv"))
 
+    def init_weights(self, std: float, rng: torch.Generator | None = None):
+        nn.init.trunc_normal_(self.qkv_proj.weight, 0.0, 0.02, generator=rng)
+        nn.init.trunc_normal_(self.o_proj.weight, 0.0, std, generator=rng)
+        self.q_norm.reset_parameters()
+        self.k_norm.reset_parameters()
+
     def forward(self, x: Tensor, pos_embeds: Tensor, varlen_info: VarlenInfo | None = None) -> Tensor:
         qkv = self.qkv_proj(x).view(*x.shape[:-1], -1, self.head_dim)
         q, k, v = qkv.split((self.num_qo_heads, self.num_kv_heads, self.num_kv_heads), dim=-2)
@@ -49,18 +57,32 @@ class Qwen3MLP(nn.Module):
         self.act_fn = nn.SiLU()
         self.register_load_state_dict_pre_hook(make_merge_hook(["gate", "up"], "gate_up"))
 
+    def init_weights(self, std: float, rng: torch.Generator | None = None):
+        gate, up = self.gate_up_proj.weight.chunk(2, dim=0)
+        nn.init.trunc_normal_(gate, 0.0, 0.02, generator=rng)
+        nn.init.trunc_normal_(up, 0.0, std, generator=rng)
+        nn.init.trunc_normal_(self.down_proj.weight, 0.0, std, generator=rng)
+
     def forward(self, x: Tensor) -> Tensor:
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(self.act_fn(gate) * up)
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, cfg: Qwen3Config) -> None:
+    def __init__(self, cfg: Qwen3Config, layer_id: int) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.self_attn = Qwen3Attention(cfg)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.mlp = Qwen3MLP(cfg)
+        self.layer_id = layer_id
+
+    def init_weights(self, rng: torch.Generator | None = None):
+        std = 0.02 / (2 * (self.layer_id + 1)) ** 0.5
+        self.input_layernorm.reset_parameters()
+        self.self_attn.init_weights(std, rng)
+        self.post_attention_layernorm.reset_parameters()
+        self.mlp.init_weights(std, rng)
 
     def forward(self, x: Tensor, pos_embeds: Tensor, varlen_info: VarlenInfo | None = None) -> Tensor:
         x = x + self.self_attn(self.input_layernorm(x), pos_embeds, varlen_info)
@@ -74,8 +96,14 @@ class Qwen3Model(nn.Module):
         self.cfg = cfg
         self.compute_dtype = compute_dtype
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, cfg.pad_token_id)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+
+    def init_weights(self, rng: torch.Generator | None = None):
+        nn.init.normal_(self.embed_tokens.weight, generator=rng)
+        for layer in self.layers:
+            layer.init_weights(rng)
+        self.norm.reset_parameters()
 
     def forward(
         self,
@@ -99,27 +127,19 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-def load_state_dict_hook(module, incompatible_keys):
-    if not module.cfg.tie_word_embeddings:
-        return
-
-    if "lm_head.weight" in incompatible_keys.missing_keys:
-        incompatible_keys.missing_keys.remove("lm_head.weight")
-    module.maybe_tie_embeddings()
-
-
 class Qwen3ForCausalLM(nn.Module):
     def __init__(self, cfg: Qwen3Config, compute_dtype: torch.dtype | None = None) -> None:
         super().__init__()
         self.cfg = cfg
         self.model = Qwen3Model(cfg, compute_dtype)
-        self.lm_head = Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        self.maybe_tie_embeddings()
-        self.register_load_state_dict_post_hook(load_state_dict_hook)
+        self.lm_head = Linear(cfg.hidden_size, cfg.vocab_size, bias=False) if not cfg.tie_word_embeddings else None
 
-    def maybe_tie_embeddings(self):
-        if self.cfg.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+    def init_weights(self, rng: torch.Generator | None = None):
+        self.model.init_weights(rng)
+        if self.lm_head is not None:
+            std = self.cfg.hidden_size**-0.5
+            cutoff = 3 * std
+            nn.init.trunc_normal_(self.lm_head.weight, 0, std, -cutoff, cutoff, generator=rng)
 
     def forward(
         self,
@@ -135,7 +155,11 @@ class Qwen3ForCausalLM(nn.Module):
             pos_ids=pos_ids,
             varlen_info=varlen_info,
         )
-        logits = self.lm_head(hidden_states)
+        if self.lm_head is not None:
+            logits = self.lm_head(hidden_states)
+        else:
+            w = self.model.embed_tokens.weight.to(hidden_states.dtype)
+            logits = F.linear(hidden_states, w)
         return logits
 
     @staticmethod
@@ -145,5 +169,7 @@ class Qwen3ForCausalLM(nn.Module):
             model = Qwen3ForCausalLM(cfg)
 
         state_dict = load_hf_state_dict(model_id)
+        if cfg.tie_word_embeddings and "lm_head.weight" in state_dict:
+            state_dict.pop("lm_head.weight")
         model.load_state_dict(state_dict, assign=True)
         return model

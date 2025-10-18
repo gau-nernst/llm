@@ -57,16 +57,30 @@ def main(args: argparse.Namespace):
 
     # TODO: add weight init logic post-shard
     cfg = Qwen3Config.from_pretrained(args.model)
-    model = Qwen3ForCausalLM(cfg).cuda()
+    with torch.device("meta"):
+        model = Qwen3ForCausalLM(cfg)
     model.model.compute_dtype = torch.bfloat16
 
     if is_ddp:
+        # initialize model on rank 0, then DDP will broadcast to other ranks
+        model.to_empty(device="cuda")
+        if is_master:
+            model.init_weights()
         model = DDP(model)
+
     elif is_fsdp:
+        # init model after sharding
         for layer in model.model.layers:
             fully_shard(layer)
             layer.compile()  # FSDP is more performant when compiling this way
         fully_shard(model)
+        model.to_empty(device="cuda")
+        model.init_weights()
+
+    else:
+        # single-GPU case
+        model.to_empty(device="cuda")
+        model.init_weights()
 
     if is_master:
         print_model_stats(model)
