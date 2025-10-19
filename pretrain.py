@@ -6,7 +6,6 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -24,19 +23,12 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer, Qwen3Config
 
+from data import infinite_stream
 from hellaswag import evaluate_hellaswag
 from modelling import Qwen3ForCausalLM
 from train_utils import LRSchedule, compute_flop, get_gpu_tflops, get_grad_norm, get_optimizer, print_model_stats
 
 HF_FS = fsspec.filesystem("hf")
-
-
-def infinite_stream(data: Sequence, seed: int):
-    rng = torch.Generator("cpu").manual_seed(seed)
-    while True:
-        indices = torch.randperm(len(data), generator=rng)
-        for idx in indices:
-            yield data[idx]
 
 
 # TODO: support resume
