@@ -60,6 +60,7 @@ def main(args: argparse.Namespace):
     with torch.device("meta"):
         model = Qwen3ForCausalLM(cfg)
     model.model.compute_dtype = torch.bfloat16
+    model.model.act_ckpt = args.activation_checkpoint
 
     flop_per_sample = compute_flop(model, args.seqlen, cfg.num_hidden_layers, cfg.num_attention_heads, cfg.head_dim)
     flop_per_train_step = flop_per_sample * args.batch_size
@@ -222,7 +223,7 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--activation_checkpointing", action="store_true")
+    parser.add_argument("--activation_checkpoint", action="store_true")
     parser.add_argument("--dist", choices=["ddp", "fsdp"])
 
     parser.add_argument("--train_ds", type=json.loads, required=True)

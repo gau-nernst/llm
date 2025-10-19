@@ -8,6 +8,7 @@
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 from transformers import Qwen3Config
 
 from .attn import VarlenInfo, attention
@@ -91,10 +92,11 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, cfg: Qwen3Config, compute_dtype: torch.dtype | None = None) -> None:
+    def __init__(self, cfg: Qwen3Config) -> None:
         super().__init__()
         self.cfg = cfg
-        self.compute_dtype = compute_dtype
+        self.compute_dtype: torch.dtype | None = None
+        self.act_ckpt = False
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, cfg.pad_token_id)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
@@ -122,16 +124,19 @@ class Qwen3Model(nn.Module):
         # pos_embeds = pos_embeds.to(hidden_states.dtype)
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, pos_embeds, varlen_info)
+            if self.act_ckpt:
+                hidden_states = checkpoint(layer, hidden_states, pos_embeds, varlen_info, use_reentrant=False)
+            else:
+                hidden_states = layer(hidden_states, pos_embeds, varlen_info)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
-    def __init__(self, cfg: Qwen3Config, compute_dtype: torch.dtype | None = None) -> None:
+    def __init__(self, cfg: Qwen3Config) -> None:
         super().__init__()
         self.cfg = cfg
-        self.model = Qwen3Model(cfg, compute_dtype)
+        self.model = Qwen3Model(cfg)
         self.lm_head = Linear(cfg.hidden_size, cfg.vocab_size, bias=False) if not cfg.tie_word_embeddings else None
 
     def init_weights(self, rng: torch.Generator | None = None):
