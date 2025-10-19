@@ -6,15 +6,16 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Sequence
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+
+import fsspec
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
-from datasets import load_dataset
-from datasets.distributed import split_dataset_by_node
 from torch import Tensor
 from torch.distributed.fsdp import fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -27,68 +28,60 @@ from hellaswag import evaluate_hellaswag
 from modelling import Qwen3ForCausalLM
 from train_utils import LRSchedule, compute_flop, get_gpu_tflops, get_grad_norm, get_optimizer, print_model_stats
 
+HF_FS = fsspec.filesystem("hf")
 
-# adapted from https://github.com/pytorch/torchtitan/blob/v0.2.0/torchtitan/datasets/hf_datasets.py
-# must have "text" column e.g.
-# - allenai/c4
-# - HuggingFaceFW/fineweb-edu
-class HFTextDataset(IterableDataset):
+
+def infinite_stream(data: Sequence, seed: int):
+    rng = torch.Generator("cpu").manual_seed(seed)
+    while True:
+        indices = torch.randperm(len(data), generator=rng)
+        for idx in indices:
+            yield data[idx]
+
+
+# TODO: support resume
+# the state would consist of
+# - shard stream i.e. infinite_stream(self.shards, self.seed)
+# - row stream i.e. HF_FS.open(shard, compression="gzip")
+# - token buffer
+# perhaps we can have a C4Shard class to hold row stream and token buffer
+class C4Dataset(IterableDataset):
     def __init__(
-        self,
-        dataset: str,
-        subset: str,
-        split: str,
-        tokenizer: str,
-        seqlen: int,
-        eval: bool,
-    ) -> None:
-        self.ds = load_dataset(dataset, name=subset, split=split, streaming=True).select_columns("text")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        self, tokenizer_id: str, subset: str = "en", split: str = "train", seqlen: int = 2048, seed: int = 2025
+    ):
+        glob_pattern = f"hf://datasets/allenai/c4/{subset}/c4-{split}.*.json.gz"  # doesn't work for all subsets
+        shards = HF_FS.glob(glob_pattern)
+        assert len(shards) > 0
+        shards.sort()
+
+        self.shards = shards
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
         self.seqlen = seqlen
-        self.eval = eval
-
-        if dist.is_initialized():
-            rank, world_size = dist.get_rank(), dist.get_world_size()
-        else:
-            rank, world_size = 0, 1
-
-        if world_size > 1:
-            self.ds = split_dataset_by_node(self.ds, rank, world_size)
-        self._epoch = 0
-        self._buffer: list[int] = []
+        self.seed = seed
 
     def __iter__(self):
-        # does HF datasets split samples among data workers automatically?
         worker_info = get_worker_info()
-        if worker_info is not None:
-            assert worker_info.num_workers == 1
+        assert worker_info is None or worker_info.num_workers == 1
 
-        SAMPLE_LEN = self.seqlen + 1
-        while True:
-            self.ds.set_epoch(self._epoch)
-            for sample in self.ds:
-                self._buffer.extend(self.tokenizer(sample["text"])["input_ids"])
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        buffer = []
+        data_len = self.seqlen + 1
 
-                while len(self._buffer) >= SAMPLE_LEN:
-                    sample = torch.tensor(self._buffer[:SAMPLE_LEN], dtype=torch.int32)
-                    self._buffer = self._buffer[SAMPLE_LEN:]
-                    yield sample[:-1], sample[1:]
+        # using the same seed across ranks -> the infinite stream is identical across ranks.
+        for shard_id, shard in enumerate(infinite_stream(self.shards, self.seed)):
+            if shard_id % world_size != rank:
+                continue
 
-            self._epoch += 1
-            if self.eval:
-                break
+            with HF_FS.open(shard, compression="gzip") as f:
+                for line in f:
+                    text = json.loads(line)["text"]
+                    buffer.extend(self.tokenizer(text)["input_ids"])
 
-    def state_dict(self):
-        return dict(
-            ds=self.ds.state_dict(),
-            _epoch=self._epoch,
-            _buffer=list(self._buffer),  # make a copy
-        )
-
-    def load_state_dict(self, state_dict: dict):
-        self.ds.load_state_dict(state_dict["ds"])
-        self._epoch = state_dict["_epoch"]
-        self._buffer = list(state_dict["_buffer"])  # make a copy
+                    while len(buffer) >= data_len:
+                        data = torch.tensor(buffer[:data_len], dtype=torch.int32)
+                        buffer = buffer[data_len:]
+                        yield data[:-1], data[1:]
 
 
 def get_loss(model: Qwen3ForCausalLM, tokens: Tensor, labels: Tensor):
@@ -160,7 +153,7 @@ def main(args: argparse.Namespace):
     else:
         lr_schedule = None
 
-    ds = HFTextDataset(tokenizer=args.model, seqlen=args.seqlen, eval=False, **args.train_ds)
+    ds = C4Dataset(args.model, subset=args.c4_subset, seqlen=args.seqlen, seed=args.seed)
     forward_bsize = args.batch_size // (args.gradient_accumulation * world_size)
     dloader = StatefulDataLoader(
         ds,
@@ -290,7 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--activation_checkpoint", action="store_true")
     parser.add_argument("--dist", choices=["ddp", "fsdp"])
 
-    parser.add_argument("--train_ds", type=json.loads, required=True)
+    parser.add_argument("--c4_subset", default="en")
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seqlen", type=int, default=2048)

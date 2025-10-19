@@ -36,6 +36,8 @@ def get_grad_norm(model: nn.Module):
 def get_optimizer(optim: str, model: nn.Module, lr: float, weight_decay: float, **kwargs):
     allowed = dict(torch=torch)
     optim_cls = eval(optim, allowed)
+    if optim_cls in (torch.optim.AdamW, torch.optim.Adam):
+        kwargs.update(fused=True)  # force fused impl
     return optim_cls(model.parameters(), lr=lr, weight_decay=weight_decay, **kwargs)
 
 

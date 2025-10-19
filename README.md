@@ -1,5 +1,7 @@
 # llm
 
+Pre-train on C4 `en` subset, `train` split.
+
 ```bash
-python pretrain.py --train_ds '{"dataset":"allenai/c4","subset":"en","split":"train"}' --seed 2025 --optim_kwargs '{"fused":true}'
+python pretrain.py --seed 2025 --model Qwen/Qwen3-1.7B --activation_checkpoint
 ```
