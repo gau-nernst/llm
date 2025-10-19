@@ -1,5 +1,6 @@
 import copy
 import io
+import json
 from typing import Sequence
 
 import fsspec
@@ -16,19 +17,33 @@ def get_hf_dataset_configs(repo_id: str):
     return meta["configs"]
 
 
-# all operations are stateful
-class ParquetShard:
+class HFShard:
     def __init__(self, repo_id: str, path: str, columns: list[str] | None = None):
         self.path = f"hf://datasets/{repo_id}/{path}"
         self.columns = list(columns)
+        self.file = None
 
+    def open_file(self, compression: str | None = None):
+        self.file = fsspec.open(self.path, compression=compression)
+        return self.file.__enter__()
+
+    def close_file(self):
+        if self.file is not None:
+            self.file.__exit__(None, None, None)
+            self.file = None
+
+
+# all operations are stateful
+class ParquetShard(HFShard):
+    def __init__(self, repo_id: str, path: str, columns: list[str] | None = None) -> None:
+        super().__init__(repo_id, path, columns)
         self.row_group_id = 0
         self.row_id = 0
         self.init()
 
     def init(self):
-        self.fs_file = fsspec.open(self.path)
-        self.pq_file = pq.ParquetFile(self.fs_file.__enter__())
+        self.close_file()
+        self.pq_file = pq.ParquetFile(self.open_file())
         self.read_row_group()
 
     def read_row_group(self):
@@ -59,6 +74,7 @@ class ParquetShard:
 
             # finish this file
             if self.row_group_id == self.pq_file.num_row_groups:
+                self.close_file()
                 raise StopIteration
 
             self.read_row_group()
@@ -67,6 +83,47 @@ class ParquetShard:
 
     def __len__(self):
         return self.pq_file.metadata.num_rows
+
+
+class JsonlShard(HFShard):
+    def __init__(self, repo_id: str, path: str, columns: list[str] | None = None) -> None:
+        super().__init__(repo_id, path, columns)
+        self.row_id = 0
+        self.init()
+
+    def init(self):
+        self.close_file()
+        self.row_iter = iter(self.open_file(compression="gzip"))
+
+        # rewind
+        for _ in range(self.row_id):
+            next(self.row_iter)
+
+    def state_dict(self):
+        return dict(row_id=self.row_id)
+
+    def load_state_dict(self, state_dict):
+        state_dict = copy.deepcopy(state_dict)
+        self.row_id = state_dict.pop("row_id")
+        assert len(state_dict) == 0  # make sure we have consumed everything
+        self.init()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # NOTE: we don't know when we will reach EOF ahead of time
+        try:
+            row = json.loads(next(self.row_iter))
+            if self.columns is not None:
+                row = {col: row[col] for col in self.columns}
+            self.row_id += 1
+
+        except StopIteration:
+            self.close_file()
+            raise
+
+        return row
 
 
 def infinite_stream(data: Sequence, seed: int):

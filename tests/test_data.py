@@ -1,11 +1,21 @@
-from data import ParquetShard
+import pytest
+
+from data import JsonlShard, ParquetShard
 
 
-def test_parquet_shard():
-    repo_id = "allenai/tulu-3-sft-mixture"
-    path = "data/train-00000-of-00006.parquet"
-
-    shard = ParquetShard(repo_id, path, columns=["messages"])
+@pytest.mark.parametrize(
+    "shard_type,repo_id,path,col",
+    [
+        ("parquet", "allenai/tulu-3-sft-mixture", "data/train-00000-of-00006.parquet", "messages"),
+        ("jsonl", "allenai/c4", "en/c4-train.00000-of-01024.json.gz", "text"),
+    ],
+)
+def test_shard(shard_type: str, repo_id: str, path: str, col: str):
+    shard_cls = dict(
+        parquet=ParquetShard,
+        jsonl=JsonlShard,
+    )[shard_type]
+    shard = shard_cls(repo_id, path, columns=[col])
 
     # basic reading
     # this particular file has 1000 rows in a rowgroup.
@@ -14,11 +24,11 @@ def test_parquet_shard():
         row = next(shard)
     assert isinstance(row, dict)
     assert len(row) == 1
-    assert "messages" in row.keys()
+    assert col in row.keys()
 
     # stateful
     state_dict = shard.state_dict()
-    resumed_shard = ParquetShard(repo_id, path, columns=["messages"])
+    resumed_shard = shard_cls(repo_id, path, columns=[col])
     resumed_shard.load_state_dict(state_dict)
 
     for _ in range(5):
