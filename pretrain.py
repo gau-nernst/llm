@@ -23,62 +23,97 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer, Qwen3Config
 
-from data import infinite_stream
+from data import get_hf_dataset_path, infinite_stream, read_shard
 from hellaswag import evaluate_hellaswag
 from modelling import Qwen3ForCausalLM
 from train_utils import LRSchedule, compute_flop, get_gpu_tflops, get_grad_norm, get_optimizer, print_model_stats
 
-HF_FS = fsspec.filesystem("hf")
 
-
-# TODO: support resume
-# the state would consist of
-# - shard stream i.e. infinite_stream(self.shards, self.seed)
-# - row stream i.e. HF_FS.open(shard, compression="gzip")
-# - token buffer
-# perhaps we can have a C4Shard class to hold row stream and token buffer
-class C4Dataset(IterableDataset):
+class TokenDataset(IterableDataset):
     def __init__(
-        self, tokenizer_id: str, subset: str = "en", split: str = "train", seqlen: int = 2048, seed: int = 2025
-    ):
-        glob_pattern = f"hf://datasets/allenai/c4/{subset}/c4-{split}.*.json.gz"  # doesn't work for all subsets
-        shards = HF_FS.glob(glob_pattern)
-        assert len(shards) > 0
-        shards.sort()
+        self,
+        tokenizer_id: str,
+        repo_id: str,
+        split: str,
+        name: str = "default",
+        seqlen: int = 2048,
+        seed: int = 2025,
+    ) -> None:
+        glob_pattern = get_hf_dataset_path(repo_id, split, name)
+        if glob_pattern is None:
+            raise RuntimeError(f"{split=}, {name=} not found for {repo_id}")
 
-        self.shards = shards
+        full_pattern = f"hf://datasets/{repo_id}/{glob_pattern}"
+        shards = fsspec.filesystem("hf").glob(full_pattern)
+        paths = [shard.removeprefix(f"datasets/{repo_id}/") for shard in shards]
+        paths.sort()
+
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        self.repo_id = repo_id
+        self.shards = paths
         self.seqlen = seqlen
         self.seed = seed
+        self.load_state_dict()
+
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+
+    def state_dict(self):
+        return dict(shard_id=self.shard_id, row_id=self.row_id, buffer=list(self.buffer))
+
+    def load_state_dict(self, state_dict: dict | None = None):
+        if state_dict is not None:
+            self.shard_id = state_dict["shard_id"]
+            self.row_id = state_dict["row_id"]
+            self.buffer = list(state_dict["buffer"])
+        else:
+            self.shard_id = 0
+            self.row_id = 0
+            self.buffer = []
+
+        self.shard_iter = infinite_stream(self.shards, self.seed)
+        for _ in range(self.shard_id):  # rewind
+            next(self.shard_iter)
+
+        shard_path = f"hf://datasets/{self.repo_id}/{next(self.shard_iter)}"
+        self.row_iter = read_shard(shard_path, ["text"])
+        for _ in range(self.row_id):  # rewind
+            next(self.row_iter)
 
     def __iter__(self):
         worker_info = get_worker_info()
         assert worker_info is None or worker_info.num_workers == 1
+        return self
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        buffer = []
-        data_len = self.seqlen + 1
+    def __next__(self):
+        while len(self.buffer) < self.seqlen + 1:
+            try:
+                row = next(self.row_iter)
+                self.row_id += 1
 
-        # using the same seed across ranks -> the infinite stream is identical across ranks.
-        for shard_id, shard in enumerate(infinite_stream(self.shards, self.seed)):
-            if shard_id % world_size != rank:
+            except StopIteration:  # exhaust current shard
+                shard_path = f"hf://datasets/{self.repo_id}/{next(self.shard_iter)}"
+                self.row_iter = read_shard(shard_path, ["text"])
+                self.shard_id += 1
+                self.row_id = 0
                 continue
 
-            with HF_FS.open(shard, compression="gzip") as f:
-                for line in f:
-                    text = json.loads(line)["text"]
-                    buffer.extend(self.tokenizer(text)["input_ids"])
+            # tokenize this row
+            self.buffer.extend(self.tokenizer(row["text"])["input_ids"])
 
-                    while len(buffer) >= data_len:
-                        data = torch.tensor(buffer[:data_len], dtype=torch.int32)
-                        buffer = buffer[data_len:]
-                        yield data[:-1], data[1:]
+        data = torch.tensor(self.buffer[: self.seqlen + 1], dtype=torch.int32)
+        self.buffer = self.buffer[self.seqlen + 1 :]
+        return data
 
 
-def get_loss(model: Qwen3ForCausalLM, tokens: Tensor, labels: Tensor):
-    logits = model(tokens).float()  # [B, L, vocab_size]
-    return F.cross_entropy(logits.view(-1, logits.shape[-1]), labels.long().view(-1))
+def get_loss(model: Qwen3ForCausalLM, data: Tensor):
+    logits = model(data[..., :-1]).float().flatten(0, 1)  # [B * L, vocab_size]
+    labels = data[..., 1:].long().flatten()  # [B * L]
+    return F.cross_entropy(logits, labels)
 
 
 def main(args: argparse.Namespace):
@@ -145,7 +180,7 @@ def main(args: argparse.Namespace):
     else:
         lr_schedule = None
 
-    ds = C4Dataset(args.model, subset=args.c4_subset, seqlen=args.seqlen, seed=args.seed)
+    ds = TokenDataset(args.model, seqlen=args.seqlen, seed=args.seed, **args.ds)
     forward_bsize = args.batch_size // (args.gradient_accumulation * world_size)
     dloader = StatefulDataLoader(
         ds,
@@ -189,8 +224,7 @@ def main(args: argparse.Namespace):
     while step < args.n_steps:
         # TODO: disable gradient all-reduce for non-last micro-steps
         for _ in range(args.gradient_accumulation):
-            tokens, labels = next(dloader_iter)
-            loss = loss_fn(model, tokens.cuda(), labels.cuda())
+            loss = loss_fn(model, next(dloader_iter).cuda())
             loss.backward()
 
         if lr_schedule is not None:
@@ -275,7 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("--activation_checkpoint", action="store_true")
     parser.add_argument("--dist", choices=["ddp", "fsdp"])
 
-    parser.add_argument("--c4_subset", default="en")
+    parser.add_argument("--ds", type=json.loads, default=dict(repo_id="allenai/c4", split="train", name="en"))
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seqlen", type=int, default=2048)
