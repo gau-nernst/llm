@@ -199,12 +199,13 @@ def main(args: argparse.Namespace):
     pbar = tqdm(total=args.n_steps, initial=step, dynamic_ncols=True, disable=not is_master)
     model.train()
     loss_fn = get_loss if is_fsdp else torch.compile(get_loss)
-    time0 = time.perf_counter()
+
     if args.profile and is_master:
         torch._inductor.config.triton.unique_kernel_names = True
         prof = torch.profiler.profile()
 
     dloader_iter = iter(dloader)
+    time0 = time.perf_counter()
     while step < args.n_steps:
         # DDP: disable gradient all-reduce for non-last micro-steps
         with model.no_sync() if is_ddp else contextlib.nullcontext():

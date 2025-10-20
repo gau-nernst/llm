@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -30,8 +31,10 @@ from modelling import Qwen3ForCausalLM
 from modelling.attn import VarlenInfo
 from train_utils import (
     LRSchedule,
+    compute_model_tflop,
     create_model,
     create_optimizer,
+    get_gpu_tflops,
     get_grad_norm,
     print_model_stats,
 )
@@ -56,7 +59,7 @@ class PackedDataset(IterableDataset):
         tokenizer_id: str,
         repo_id: str,
         split: str,
-        name: str = "default",
+        name: str | None = None,
         maxlen: int = 2048,
         seed: int = 2025,
     ) -> None:
@@ -199,23 +202,66 @@ def main(args: argparse.Namespace):
         dloader.load_state_dict(ckpt["dloader"])
         step = ckpt["step"]
 
+    def compute_tflop(seqlen_list: list[int]):
+        cfg = model.cfg
+        return sum(
+            compute_model_tflop(
+                cfg.hidden_size,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.intermediate_size,
+                cfg.vocab_size,
+                cfg.num_hidden_layers,
+                seqlen,
+                training=True,
+            )
+            for seqlen in seqlen_list
+        )
+
+    gpu_tflops = get_gpu_tflops()
+    num_tokens_seen_millions = 0
+    num_samples_seen = 0
+    tokens_cnt = 0
+    tflop_cnt = 0
+
     log_interval = 50
     pbar = tqdm(total=args.n_steps, initial=step, dynamic_ncols=True, disable=not is_master)
     model.train()
     loss_fn = get_loss if is_fsdp else torch.compile(get_loss, dynamic=True)
+
+    # run forward+backward on the largest possible sequence first for PyTorch to allocate
+    # enough memory + make sure we don't OOM on the largest sequence.
+    # => no memory increase during training + less fragmentation.
+    # in practice, there is still memory increase.
+    batch = PackedData(
+        inputs=torch.randint(model.cfg.vocab_size, size=(args.maxlen,), dtype=torch.int32, device="cuda"),
+        targets=torch.randint(model.cfg.vocab_size, size=(args.maxlen,), dtype=torch.int32, device="cuda"),
+        pos_ids=torch.arange(args.maxlen, dtype=torch.int32, device="cuda"),
+        offsets=torch.tensor([0, args.maxlen], dtype=torch.int32, device="cuda"),
+        max_seqlen=args.maxlen,
+    )
+    loss_fn(model, batch).backward()
+    optim.zero_grad()  # clear gradient
+
     if args.profile and is_master:
         torch._inductor.config.triton.unique_kernel_names = True
         prof = torch.profiler.profile()
 
     dloader_iter = iter(dloader)
+    time0 = time.perf_counter()
     while step < args.n_steps:
         # DDP: disable gradient all-reduce for non-last micro-steps
-        with model.no_sync() if is_ddp else contextlib.nullcontext():
-            for _ in range(args.grad_accum - 1):
-                loss = loss_fn(model, next(dloader_iter).cuda())
+        for i in range(args.grad_accum):
+            batch = next(dloader_iter)
+
+            with model.no_sync() if (is_ddp and i < args.grad_accum - 1) else contextlib.nullcontext():
+                loss = loss_fn(model, batch.cuda())
                 loss.backward()
-        loss = loss_fn(model, next(dloader_iter).cuda())
-        loss.backward()
+
+            num_samples_seen += batch.offsets.shape[0] - 1
+            tokens_cnt += batch.inputs.shape[0]
+            tflop_cnt += compute_tflop(batch.offsets.diff().tolist())
 
         if lr_schedule is not None:
             lr_schedule.set_lr(step, optim)
@@ -248,10 +294,20 @@ def main(args: argparse.Namespace):
             prof.start()
 
         if step % log_interval == 0 and is_master:
-            # TODO: add num_tokens and MFU
+            time1 = time.perf_counter()
+            num_tokens_seen_millions += tokens_cnt / 1e6
             log_dict = dict(
                 max_memory_allocated_gb=torch.cuda.max_memory_allocated() / 1e9,
+                num_samples_seen=num_samples_seen,
+                num_tokens_seen_millions=num_tokens_seen_millions,
+                tokens_per_second=tokens_cnt / (time1 - time0),
+                tflops=tflop_cnt / (time1 - time0),
             )
+            if gpu_tflops != 0:
+                log_dict["mfu"] = log_dict["tflops"] / gpu_tflops
+            time0 = time1
+            tokens_cnt = 0
+            tflop_cnt = 0
             logger.log(log_dict, step=step)
 
         if args.ckpt_interval > 0 and step % args.ckpt_interval == 0:
