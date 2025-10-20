@@ -111,9 +111,9 @@ class TokenDataset(IterableDataset):
 
 
 def get_loss(model: Qwen3ForCausalLM, data: Tensor):
-    logits = model(data[..., :-1]).float().flatten(0, 1)  # [B * L, vocab_size]
-    labels = data[..., 1:].long().flatten()  # [B * L]
-    return F.cross_entropy(logits, labels)
+    logits = model(data[..., :-1]).flatten(0, 1)  # [B * L, vocab_size]
+    labels = data[..., 1:].flatten()  # [B * L]
+    return F.cross_entropy(logits.float(), labels.long())
 
 
 def main(args: argparse.Namespace):
@@ -133,7 +133,7 @@ def main(args: argparse.Namespace):
         if is_master:
             print(f"Using distributed training with {world_size=}")
 
-    assert args.bsize % (args.gradient_accumulation * world_size) == 0
+    assert args.bsize % (args.grad_accum * world_size) == 0
     if args.seed is not None:
         torch.manual_seed(args.seed + rank)
     if args.profile:
@@ -165,7 +165,7 @@ def main(args: argparse.Namespace):
         lr_schedule = None
 
     ds = TokenDataset(args.model, seqlen=args.seqlen, seed=args.seed, **args.ds)
-    forward_bsize = args.bsize // (args.gradient_accumulation * world_size)
+    forward_bsize = args.bsize // (args.grad_accum * world_size)
     dloader = StatefulDataLoader(
         ds,
         batch_size=forward_bsize,
@@ -208,7 +208,7 @@ def main(args: argparse.Namespace):
     while step < args.n_steps:
         # DDP: disable gradient all-reduce for non-last micro-steps
         with model.no_sync() if is_ddp else contextlib.nullcontext():
-            for _ in range(args.gradient_accumulation - 1):
+            for _ in range(args.grad_accum - 1):
                 loss = loss_fn(model, next(dloader_iter).cuda())
                 loss.backward()
         loss = loss_fn(model, next(dloader_iter).cuda())
@@ -300,7 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--bsize", type=int, default=4)
     parser.add_argument("--seqlen", type=int, default=2048)
-    parser.add_argument("--gradient_accumulation", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=1)
 
     parser.add_argument("--optim", default="torch.optim.AdamW")
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -315,7 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_interval", type=int, default=1000)
     parser.add_argument("--project")
     parser.add_argument("--run_name")
-    parser.add_argument("--seed", type=int)
+    parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
 
