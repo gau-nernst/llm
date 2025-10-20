@@ -1,10 +1,11 @@
 import io
 import json
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import fsspec
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 import yaml
 from huggingface_hub import hf_hub_download
 
@@ -55,8 +56,24 @@ def get_hf_dataset_path(repo_id: str, split: str, name: str = "default"):
     return glob_pattern
 
 
-def infinite_stream(data: Sequence, seed: int):
+# yield a deterministic sequence
+def shuffle_iter(n: int, seed: int):
     rng = torch.Generator("cpu").manual_seed(seed)
     while True:
-        indices = torch.randperm(len(data), generator=rng).tolist()
-        yield from (data[idx] for idx in indices)
+        yield from torch.randperm(n, generator=rng).tolist()
+
+
+def distribute_iter(iter_: Iterable):
+    """With world size N, rank i will take elements whose index % world_size == rank"""
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+
+    counter = 0
+    for x in iter_:
+        if counter == rank:
+            yield x
+        counter = (counter + 1) % world_size

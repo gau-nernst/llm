@@ -5,13 +5,31 @@ from torch import Tensor, nn
 
 
 # https://github.com/pytorch/torchtitan/blob/v0.2.0/torchtitan/models/utils.py#L363
-def compute_flop(model: nn.Module, seqlen: int, num_layers: int, num_heads: int, head_dim: int):
-    linear_params = sum(m.weight.numel() for m in model.modules() if isinstance(m, nn.Linear))
-    linear_flop = 2 * seqlen * linear_params
-    attn_flop = 4 * num_layers * num_heads * head_dim * seqlen * seqlen
+def compute_model_tflop(
+    dim: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    mlp_dim: int,
+    vocab_size: int,
+    num_layers: int,
+    seqlen: int,
+    training: bool,
+):
+    # linear layers
+    attn_proj_params = 2 * dim * (num_qo_heads + num_kv_heads) * head_dim  # qkv and o projections
+    mlp_params = 3 * dim * mlp_dim  # gate, up, and down projections
+    perlayer_linear_flop = 2 * seqlen * (attn_proj_params + mlp_params)
 
-    # every matmul in forward needs 2 matmul in backward
-    return 3 * (linear_flop + attn_flop)
+    # divide by 2 due to causal attention
+    perlayer_attn_flop = 4 * num_qo_heads * head_dim * seqlen * seqlen // 2
+
+    lmhead_flop = 2 * seqlen * dim * vocab_size
+
+    flop = (perlayer_linear_flop + perlayer_attn_flop) * num_layers + lmhead_flop
+    if training:
+        flop *= 3  # each matmul in forward requires 2 matmuls in backward
+    return flop / 1e12
 
 
 def get_gpu_tflops():

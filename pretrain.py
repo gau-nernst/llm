@@ -1,6 +1,7 @@
 # torchrun --standalone --nproc_per_node=2 pretrain.py
 
 import argparse
+import contextlib
 import json
 import os
 import time
@@ -8,7 +9,6 @@ from datetime import datetime
 from pathlib import Path
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
 
 import fsspec
 import torch
@@ -23,10 +23,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer, Qwen3Config
 
-from data import get_hf_dataset_path, infinite_stream, read_shard
+from data import distribute_iter, get_hf_dataset_path, read_shard, shuffle_iter
 from hellaswag import evaluate_hellaswag
 from modelling import Qwen3ForCausalLM
-from train_utils import LRSchedule, compute_flop, get_gpu_tflops, get_grad_norm, get_optimizer, print_model_stats
+from train_utils import LRSchedule, compute_model_tflop, get_gpu_tflops, get_grad_norm, get_optimizer, print_model_stats
 
 
 class TokenDataset(IterableDataset):
@@ -55,33 +55,27 @@ class TokenDataset(IterableDataset):
         self.seed = seed
         self.load_state_dict()
 
-        if dist.is_initialized():
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
-        else:
-            self.rank = 0
-            self.world_size = 1
-
     def state_dict(self):
-        return dict(shard_id=self.shard_id, row_id=self.row_id, buffer=list(self.buffer))
+        return dict(shard_cnt=self.shard_cnt, row_cnt=self.row_cnt, buffer=list(self.buffer))
 
     def load_state_dict(self, state_dict: dict | None = None):
         if state_dict is not None:
-            self.shard_id = state_dict["shard_id"]
-            self.row_id = state_dict["row_id"]
+            self.shard_cnt = state_dict["shard_cnt"]
+            self.row_cnt = state_dict["row_cnt"]
             self.buffer = list(state_dict["buffer"])
         else:
-            self.shard_id = 0
-            self.row_id = 0
+            self.shard_cnt = 0
+            self.row_cnt = 0
             self.buffer = []
 
-        self.shard_iter = infinite_stream(self.shards, self.seed)
-        for _ in range(self.shard_id):  # rewind
-            next(self.shard_iter)
+        self.shard_id_iter = shuffle_iter(len(self.shards), self.seed)
+        self.shard_id_iter = distribute_iter(self.shard_id_iter)
+        for _ in range(self.shard_cnt):  # rewind
+            next(self.shard_id_iter)
 
-        shard_path = f"hf://datasets/{self.repo_id}/{next(self.shard_iter)}"
-        self.row_iter = read_shard(shard_path, ["text"])
-        for _ in range(self.row_id):  # rewind
+        path = self.shards[next(self.shard_id_iter)]
+        self.row_iter = read_shard(f"hf://datasets/{self.repo_id}/{path}", ["text"])
+        for _ in range(self.row_cnt):  # rewind
             next(self.row_iter)
 
     def __iter__(self):
@@ -93,13 +87,13 @@ class TokenDataset(IterableDataset):
         while len(self.buffer) < self.seqlen + 1:
             try:
                 row = next(self.row_iter)
-                self.row_id += 1
+                self.row_cnt += 1
 
             except StopIteration:  # exhaust current shard
-                shard_path = f"hf://datasets/{self.repo_id}/{next(self.shard_iter)}"
-                self.row_iter = read_shard(shard_path, ["text"])
-                self.shard_id += 1
-                self.row_id = 0
+                path = self.shards[next(self.shard_id_iter)]
+                self.row_iter = read_shard(f"hf://datasets/{self.repo_id}/{path}", ["text"])
+                self.shard_cnt += 1
+                self.row_cnt = 0
                 continue
 
             # tokenize this row
@@ -133,7 +127,7 @@ def main(args: argparse.Namespace):
         if is_master:
             print(f"Using distributed training with {world_size=}")
 
-    assert args.batch_size % (args.gradient_accumulation * world_size) == 0
+    assert args.bsize % (args.gradient_accumulation * world_size) == 0
     if args.seed is not None:
         torch.manual_seed(args.seed + rank)
     if args.profile:
@@ -144,10 +138,20 @@ def main(args: argparse.Namespace):
     with torch.device("meta"):
         model = Qwen3ForCausalLM(cfg)
     model.model.compute_dtype = torch.bfloat16
-    model.model.act_ckpt = args.activation_checkpoint
+    model.model.act_ckpt = args.act_ckpt
 
-    flop_per_sample = compute_flop(model, args.seqlen, cfg.num_hidden_layers, cfg.num_attention_heads, cfg.head_dim)
-    flop_per_train_step = flop_per_sample * args.batch_size
+    tflop_per_sample = compute_model_tflop(
+        cfg.hidden_size,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        cfg.intermediate_size,
+        cfg.vocab_size,
+        cfg.num_hidden_layers,
+        args.seqlen,
+        training=True,
+    )
+    tflop_per_train_step = tflop_per_sample * args.bsize
     gpu_tflops = get_gpu_tflops()
 
     if is_ddp:
@@ -181,7 +185,7 @@ def main(args: argparse.Namespace):
         lr_schedule = None
 
     ds = TokenDataset(args.model, seqlen=args.seqlen, seed=args.seed, **args.ds)
-    forward_bsize = args.batch_size // (args.gradient_accumulation * world_size)
+    forward_bsize = args.bsize // (args.gradient_accumulation * world_size)
     dloader = StatefulDataLoader(
         ds,
         batch_size=forward_bsize,
@@ -222,10 +226,13 @@ def main(args: argparse.Namespace):
 
     dloader_iter = iter(dloader)
     while step < args.n_steps:
-        # TODO: disable gradient all-reduce for non-last micro-steps
-        for _ in range(args.gradient_accumulation):
-            loss = loss_fn(model, next(dloader_iter).cuda())
-            loss.backward()
+        # DDP: disable gradient all-reduce for non-last micro-steps
+        with model.no_sync() if is_ddp else contextlib.nullcontext():
+            for _ in range(args.gradient_accumulation - 1):
+                loss = loss_fn(model, next(dloader_iter).cuda())
+                loss.backward()
+        loss = loss_fn(model, next(dloader_iter).cuda())
+        loss.backward()
 
         if lr_schedule is not None:
             lr_schedule.set_lr(step, optim)
@@ -258,13 +265,13 @@ def main(args: argparse.Namespace):
             prof.start()
 
         if step % log_interval == 0 and is_master:
-            tokens_per_batch = args.batch_size * args.seqlen
+            tokens_per_batch = args.bsize * args.seqlen
             time1 = time.perf_counter()
             log_dict = dict(
                 max_memory_allocated_gb=torch.cuda.max_memory_allocated() / 1e9,
                 num_tokens_seen_millions=tokens_per_batch * step / 1e6,
                 tokens_per_second=tokens_per_batch * log_interval / (time1 - time0),
-                tflops=flop_per_train_step * log_interval / (time1 - time0) * 1e-12,
+                tflops=tflop_per_train_step * log_interval / (time1 - time0),
             )
             if gpu_tflops != 0:
                 log_dict["mfu"] = log_dict["tflops"] / gpu_tflops
@@ -306,12 +313,12 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--activation_checkpoint", action="store_true")
+    parser.add_argument("--act_ckpt", action="store_true")
     parser.add_argument("--dist", choices=["ddp", "fsdp"])
 
     parser.add_argument("--ds", type=json.loads, default=dict(repo_id="allenai/c4", split="train", name="en"))
     parser.add_argument("--n_steps", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--bsize", type=int, default=4)
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
 
