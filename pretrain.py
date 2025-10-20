@@ -16,17 +16,23 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 from torch import Tensor
-from torch.distributed.fsdp import fully_shard
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import IterableDataset, get_worker_info
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer, Qwen3Config
+from transformers import AutoTokenizer
 
 from data import distribute_iter, get_hf_dataset_path, read_shard, shuffle_iter
 from hellaswag import evaluate_hellaswag
 from modelling import Qwen3ForCausalLM
-from train_utils import LRSchedule, compute_model_tflop, get_gpu_tflops, get_grad_norm, get_optimizer, print_model_stats
+from train_utils import (
+    LRSchedule,
+    compute_model_tflop,
+    create_model,
+    create_optimizer,
+    get_gpu_tflops,
+    get_grad_norm,
+    print_model_stats,
+)
 
 
 class TokenDataset(IterableDataset):
@@ -134,51 +140,25 @@ def main(args: argparse.Namespace):
         args.n_steps = 5
     args.torch_version = torch.__version__
 
-    cfg = Qwen3Config.from_pretrained(args.model)
-    with torch.device("meta"):
-        model = Qwen3ForCausalLM(cfg)
-    model.model.compute_dtype = torch.bfloat16
-    model.model.act_ckpt = args.act_ckpt
+    model = create_model(args.model, args.act_ckpt, args.dist)
+    if is_master:
+        print_model_stats(model)
 
     tflop_per_sample = compute_model_tflop(
-        cfg.hidden_size,
-        cfg.num_attention_heads,
-        cfg.num_key_value_heads,
-        cfg.head_dim,
-        cfg.intermediate_size,
-        cfg.vocab_size,
-        cfg.num_hidden_layers,
+        model.cfg.hidden_size,
+        model.cfg.num_attention_heads,
+        model.cfg.num_key_value_heads,
+        model.cfg.head_dim,
+        model.cfg.intermediate_size,
+        model.cfg.vocab_size,
+        model.cfg.num_hidden_layers,
         args.seqlen,
         training=True,
     )
     tflop_per_train_step = tflop_per_sample * args.bsize
     gpu_tflops = get_gpu_tflops()
 
-    if is_ddp:
-        # initialize model on rank 0, then DDP will broadcast to other ranks
-        model.to_empty(device="cuda")
-        if is_master:
-            model.init_weights()
-        model = DDP(model)
-
-    elif is_fsdp:
-        # init model after sharding
-        for layer in model.model.layers:
-            fully_shard(layer)
-            layer.compile()  # FSDP is more performant when compiling this way
-        fully_shard(model)
-        model.to_empty(device="cuda")
-        model.init_weights()
-
-    else:
-        # single-GPU case
-        model.to_empty(device="cuda")
-        model.init_weights()
-
-    if is_master:
-        print_model_stats(model)
-
-    optim = get_optimizer(args.optim, model, args.lr, args.weight_decay, **args.optim_kwargs)
+    optim = create_optimizer(args.optim, model, args.lr, args.weight_decay, **args.optim_kwargs)
     if args.lr_schedule_kwargs is not None:
         lr_schedule = LRSchedule(args.lr, args.n_steps, **args.lr_schedule_kwargs)
     else:

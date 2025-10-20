@@ -1,7 +1,54 @@
 import math
 
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
+from torch.distributed.fsdp import fully_shard
+from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import Qwen3Config
+
+from modelling import Qwen3ForCausalLM
+
+
+def create_model(model_id: str, act_ckpt: bool = False, dist_mode: str | None = None):
+    cfg = Qwen3Config.from_pretrained(model_id)
+    with torch.device("meta"):
+        model = Qwen3ForCausalLM(cfg)
+    model.model.compute_dtype = torch.bfloat16
+    model.model.act_ckpt = act_ckpt
+
+    if dist_mode == "ddp":
+        # initialize model on rank 0, then DDP will broadcast to other ranks
+        model.to_empty(device="cuda")
+        if dist.get_rank() == 0:
+            model.init_weights()
+        model = DDP(model)
+
+    elif dist_mode == "fsdp":
+        # init model after sharding
+        for layer in model.model.layers:
+            fully_shard(layer)
+            # NOTE: should we move compile out of this function?
+            layer.compile()  # FSDP is more performant when compiling this way
+        fully_shard(model)
+        model.to_empty(device="cuda")
+        model.init_weights()
+
+    else:
+        # single-GPU case
+        assert dist_mode is None
+        model.to_empty(device="cuda")
+        model.init_weights()
+
+    return model
+
+
+def create_optimizer(optim: str, model: nn.Module, lr: float, weight_decay: float, **kwargs):
+    allowed = dict(torch=torch)
+    optim_cls = eval(optim, allowed)
+    if optim_cls in (torch.optim.AdamW, torch.optim.Adam):
+        kwargs.update(fused=True)  # force fused impl
+    return optim_cls(model.parameters(), lr=lr, weight_decay=weight_decay, **kwargs)
 
 
 # https://github.com/pytorch/torchtitan/blob/v0.2.0/torchtitan/models/utils.py#L363
@@ -49,14 +96,6 @@ def get_grad_norm(model: nn.Module):
     if hasattr(grad_norm_sq, "full_tensor"):
         grad_norm_sq = grad_norm_sq.full_tensor()
     return grad_norm_sq.item() ** 0.5
-
-
-def get_optimizer(optim: str, model: nn.Module, lr: float, weight_decay: float, **kwargs):
-    allowed = dict(torch=torch)
-    optim_cls = eval(optim, allowed)
-    if optim_cls in (torch.optim.AdamW, torch.optim.Adam):
-        kwargs.update(fused=True)  # force fused impl
-    return optim_cls(model.parameters(), lr=lr, weight_decay=weight_decay, **kwargs)
 
 
 def print_model_stats(model: nn.Module):
