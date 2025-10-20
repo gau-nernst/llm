@@ -133,6 +133,8 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    _cfg_cls = Qwen3Config
+
     def __init__(self, cfg: Qwen3Config) -> None:
         super().__init__()
         self.cfg = cfg

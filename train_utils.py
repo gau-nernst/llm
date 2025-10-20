@@ -4,41 +4,67 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import distribute_tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import Qwen3Config
 
 from modelling import Qwen3ForCausalLM
+from modelling.utils import load_hf_state_dict
 
 
-def create_model(model_id: str, act_ckpt: bool = False, dist_mode: str | None = None):
-    cfg = Qwen3Config.from_pretrained(model_id)
+def create_model(model_id: str, pretrained: bool = False, act_ckpt: bool = False, dist_mode: str | None = None):
+    cfg_cls = Qwen3ForCausalLM._cfg_cls
+    cfg = cfg_cls.from_pretrained(model_id)
     with torch.device("meta"):
         model = Qwen3ForCausalLM(cfg)
     model.model.compute_dtype = torch.bfloat16
     model.model.act_ckpt = act_ckpt
 
+    if pretrained:
+        state_dict = load_hf_state_dict(model_id)
+        if cfg.tie_word_embeddings and "lm_head.weight" in state_dict:
+            state_dict.pop("lm_head.weight")
+
     if dist_mode == "ddp":
         # initialize model on rank 0, then DDP will broadcast to other ranks
-        model.to_empty(device="cuda")
         if dist.get_rank() == 0:
-            model.init_weights()
+            if pretrained:
+                model.load_state_dict(state_dict, assign=True)
+                model.cuda()
+            else:
+                model.to_empty(device="cuda")
+                model.init_weights()
+        else:
+            model.to_empty(device="cuda")
         model = DDP(model)
 
     elif dist_mode == "fsdp":
+        # NOTE: not tested
         # init model after sharding
         for layer in model.model.layers:
             fully_shard(layer)
             # NOTE: should we move compile out of this function?
             layer.compile()  # FSDP is more performant when compiling this way
         fully_shard(model)
-        model.to_empty(device="cuda")
-        model.init_weights()
+
+        if pretrained:
+            meta_sd = model.state_dict()
+            sharded_state_dict = {
+                k: distribute_tensor(v, meta_sd[k].device_mesh, meta_sd[k].placements) for k, v in state_dict.items()
+            }
+            model.load_state_dict(sharded_state_dict, assign=True)
+        else:
+            model.to_empty(device="cuda")
+            model.init_weights()
 
     else:
         # single-GPU case
         assert dist_mode is None
-        model.to_empty(device="cuda")
-        model.init_weights()
+        if pretrained:
+            model.load_state_dict(state_dict, assign=True)
+            model.cuda()
+        else:
+            model.to_empty(device="cuda")
+            model.init_weights()
 
     return model
 

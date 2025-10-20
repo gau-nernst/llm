@@ -162,7 +162,7 @@ def main(args: argparse.Namespace):
         args.n_steps = 5
     args.torch_version = torch.__version__
 
-    model = create_model(args.model, args.act_ckpt, args.dist)
+    model = create_model(args.model, pretrained=True, act_ckpt=args.act_ckpt, dist_mode=args.dist)
     if is_master:
         print_model_stats(model)
 
