@@ -7,23 +7,25 @@ Resources:
 
 ## Motivation
 
-Starting from softmax attention. We have a query vector q `[dim]` and Key-Value matrices K `[L, dim]` and V `[L, dim]`. In code form:
+Starting from softmax attention. We have a query vector q `[1, dim]` and Key-Value matrices K `[L, dim]` and V `[L, dim]`. We purposely treat vectors as row vectors so that when we stack multiple vectors together to form a matrix, the equations stay the same. In code form:
 
 ```python
-s = q @ K.T     # [L]
-p = softmax(s)  # [L]
-o = p @ V       # [dim]
+s = q @ K.T     # [1, L]
+p = softmax(s)  # [1, L]
+o = p @ V       # [1, dim]
 ```
 
 In math form
 
 ```math
-\vec o = \sum_i \frac{\exp(\vec q \cdot \vec k_i)}{\sum_j \exp(\vec q \cdot \vec k_j)} \vec v_i
+\vec o = \sum_i \frac{\exp\left(\vec q \, \vec k_i^T\right)}{\sum_j \exp\left(\vec q \, \vec k_j^T\right)} \vec v_i
 ```
 
 ```math
-= \frac{\sum_i \exp(\vec q \cdot \vec k_i) \vec v_i}{\sum_j \exp(\vec q \cdot \vec k_j)}
+= \frac{\sum_i \exp(\vec q \, \vec k_i^T) \vec v_i}{\sum_j \exp(\vec q \, \vec k_j^T)}
 ```
+
+Note that because we define vectors as row vectors instead of the usual column vectors, dot product has the 2nd vector transposed instead of the 2nd one. Similarly, cross product in our analysis has the 1st vector transposed.
 
 Let's remove the softmax operator, which enables us to reorder the ops. This becomes **Linear attention**.
 
@@ -32,34 +34,32 @@ o = (q @ K.T) @ V
   = q @ (K.T @ V)
 ```
 
-We can define the **State matrix** `S = K.T @ V`, which has shape `[dim, dim]`. The reduction is done over the sequence length dimension. This can be seen as a **Recurrent network**.
+We can define the **State matrix** `S = K.T @ V`, which has shape `[dim_k, dim_v]`. The reduction is done over the sequence length dimension. This can be seen as a **Recurrent network**.
 
 ```math
-S_t = \sum_{i=1}^{i=t} \vec k_i \otimes \vec v_i
+S_t = \sum_{i=1}^{i=t} \vec k_i^T \vec v_i
 ```
 
 ```math
-= S_{t-1} + \vec k_t \otimes \vec v_t
+= S_{t-1} + \vec k_t^T \vec v_t
 ```
 
-Where $\otimes$ is **outer product** `[dim_k] x [dim_v] -> [dim_k,dim_v]`. The output at each time step is simply the query projected using the state at that time step `o_t = q_t @ S_t`. The equation above is also known as the Recurrent form of Linear attention.
-
-TODO: change the outer product to matmul notation.
+Notice that $\vec k_t^T \vec v_t$ is the **outer product** between the key and value vectors. The output at each time step is simply the query projected using the state at that time step $o_t = q_t S_t$. The equation above is also known as the Recurrent form of Linear attention.
 
 By modifying the recurrent relation a bit, we obtain **DeltaNet**.
 
 ```math
-S_t = S_{t-1} + \beta_t \vec k_t \otimes (\vec v_t - \vec k_t \cdot S_{t-1})
+S_t = S_{t-1} + \beta_t \vec k_t^T (\vec v_t - \vec k_t S_{t-1})
 ```
 
-The term $\vec k_t \cdot S_{t-1}$ can be seen as the **predicted value** using the old state matrix $S_{t-1}$. Hence, the recurrence relation suggests an **online learning** process of $S$, which models value as a linear projection of key. The loss function is L2.
+The term $\vec k_t S_{t-1}$ can be seen as the **predicted value** using the old state matrix $S_{t-1}$. Hence, the recurrence relation suggests an **online learning** process of $S$, which models value as a linear projection of key. The loss function is L2.
 
 ```math
-L = \frac{1}{2} \lVert \vec k \cdot S - \vec v \rVert^2
+L = \frac{1}{2} \lVert \vec k S - \vec v \rVert^2
 ```
 
 ```math
-\nabla_S L = \vec k \otimes (\vec k \cdot S - \vec v)
+\nabla_S L = \vec k^T (\vec k S - \vec v)^T
 ```
 
 The update only uses the latest key-value data point (hence, online learning). We can apply the same perspective to the original Linear attention, which turns out to be optimizing for cosine similarity.
@@ -69,13 +69,13 @@ The update only uses the latest key-value data point (hence, online learning). W
 Gated Linear attention
 
 ```math
-S_t = g_t S_{t-1} + \vec k_t \otimes \vec v_t
+S_t = g_t S_{t-1} + \vec k_t^T \vec v_t
 ```
 
 Gated DeltaNet
 
 ```math
-S_t = g_t S_{t-1} + \beta_t \vec k_t \otimes (\vec v_t - \vec k_t \cdot g_t S_{t-1})
+S_t = g_t S_{t-1} + \beta_t \vec k_t^T (\vec v_t - g_t \vec k_t S_{t-1})
 ```
 
 ## Linear Attention: Parallel Computation
@@ -148,16 +148,30 @@ When we have sufficiently large batch size (number of attention heads is fixed),
 Update rule of Gated Linear Attention
 
 ```math
-S_t = g_t S_{t-1} + \vec k_t \otimes \vec v_t
+S_t = g_t S_{t-1} + \vec k_t^T \vec v_t
 ```
 
-Unrolling the recursive updates from a to b, we get the following
+Let's unroll it one more time to observe the pattern.
 
 ```math
-S_b = \left(g_{a+1} \dots g_b \right) S_a + \sum_{t=a+1}^b \left(g_{a+1} \dots g_t \right) \vec k_t \otimes \vec v_t
+S_t = g_t \left( g_{t-1} S_{t-2} + \vec k_{t-1}^T \vec v_{t-1} \right) + \vec k_t^T \vec v_t
 ```
 
-The cumulative gating factor is a bit annoying, but I suppose it's not the end of the world. We can compute the cumulative product first, pre-multiply it to keys, then use the tensor cores as usual.
+```math
+= g_t g_{t-1} S_{t-2} + g_t \vec k_{t-1}^T \vec v_{t-1} + \vec k_t^T \vec v_t
+```
+
+Generalizing it
+
+```math
+S_b = \left(g_b \dots g_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec v_t
+```
+
+```math
+= \left(g_b \dots g_{a+1} \right) S_a + \left(g_b \cdots g_{a+1}\right) \sum_{t=a+1}^b \left(\frac{1}{g_t \cdots g_{a+1}}\right) \vec k_t^T \vec v_t
+```
+
+The cumulative gating factor is a bit annoying, but I suppose it's not the end of the world. We can compute the cumulative product first, divide keys by it, then use the tensor cores as usual.
 
 One note on numerical stability. Multiplying a lot of <1 numbers together is usually not a good idea. We can use the well-known log trick.
 
@@ -170,59 +184,83 @@ Moreover, we can predict $\log g_t$ directly, hence only an extra exponential is
 To compute the output
 
 ```math
-o_b = q_b S_b
+\vec o_b = \vec q_b S_b
 ```
 
 ```math
-= \left(g_{a+1} \dots g_b \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_{a+1} \dots g_t \right) (\vec q_b \cdot \vec k_t) \vec v_t
+= \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{a+1} \right) \vec q_b \left(\frac{1}{g_t \cdots g_{a+1}}\right) \vec k_t^T \vec v_t
 ```
 
-Notice that we have removed the outer product $\vec k_t \otimes \vec v_t$ by computing the dot product $\vec q_b \cdot \vec k_t$ first. Next, we stack multiple consecutive queries together to form a matrix multiplication:
-- The first term becomes `G * Q @ S`, where G is the cumulative gating factor having different values for each query position. It doesn't matter if we multiply G with Q first, or multiply G with the matmul result Q @ S.
-  - G has shape `[BLOCK_T, 1]`, Q has shape `[BLOCK_T, dim]`, S has shape `[dim, dim]`.
-  - Intuitively, given a query token, it means we "discount" the old state matrix by the (cumulative) gating factor, as determined by the distance `b-a`.
-- The second term becomes `((Q @ (G * K).T) * M) @ V`, where M is the causal mask. We have to pre-multiply G with K for the math to work out correctly.
+Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the dot product $\vec q_b \vec k_t^T$ (ignoring the extra scaling). We can pre-multiply $\vec q_b$ with the cumulative product $\left(g_b \cdots g_{a+1}\right)$ (notice the product goes from $a+1$ to $b$ for query at $b$), and pre-divide $\vec k_t^T$ with the cumulative product $\left(g_t \cdots g_{a+1}\right)$ (notice the product goes from $a+1$ to $t$ for key at $t$). This is good because we can do this pre-multiplication for all queries (and pre-division for all keys) in parallel (after obtaining the cumulative product).
 
-Note: GLA paper rewrites the equations above a bit in terms of how the cumulative gating factors are computed and fused into matmul inputs/outputs. I haven't tried to implement GLA, but it doesn't seem necessary.
+Next, we stack multiple consecutive queries together to form a matrix multiplication:
+- The first term becomes `(G * Q) @ S`, where `G * Q` is the scaled queries computed in parallel.
+- The second term becomes `((G * Q) @ (1/G * K).T) * M) @ V`, where `1/G * K` is the scaled keys computed in parallel, and M is the causal mask.
 
 ## Gated DeltaNet: Parallel Computation
 
 As usual, let's start with the Update rule
 
 ```math
-S_t = g_t S_{t-1} + \beta_t \vec k_t \otimes (\vec v_t - \vec k_t \cdot g_t S_{t-1})
+S_t = g_t S_{t-1} + \beta_t \vec k_t^T (\vec v_t - g_t \vec k_t S_{t-1})
 ```
 
 Let's group all the terms involving the previous state together.
 
 ```math
-S_t = g_t (I - \beta_t \vec k_t \otimes \vec k_t) S_t + \beta_t \vec k_t \otimes \vec v_t
+S_t = g_t (I - \beta_t \vec k_t^T \vec k_t) S_{t-1} + \beta_t \vec k_t^T \vec v_t
 ```
 
-Uh oh, the gating term now involves a matrix multiplication with the previous state. If we unroll the recursive relations N times, there will be N extra matrix multiplications. Defining $H_t = I - \beta_t \vec k_t \otimes \vec k_t$, we have (I'm using a random letter H here, not following any conventions):
+```math
+
+```
+
+Uh oh, the gating term now involves a matrix multiplication with the previous state. If we unroll the recursive relations N times, there will be N extra matrix multiplications. Defining $H_t = I - \beta_t \vec k_t^T \vec k_t$, we have (I'm using a random letter H here, not following any conventions):
 
 ```math
-S_b = \left(g_{a+1} \dots g_b \right) \left(H_{a+1} \dots H_b \right) S_a + \sum_{t=a+1}^b \left(g_{a+1} \dots g_b \right) \left(H_{a+1} \dots H_b \right) \vec k_t \otimes \vec v_t
+S_b = \left(g_b \dots g_{a+1} \right) \left(H_b \dots H_{a+1} \right) S_a + \sum_{t=a+1}^b \left(\beta_t \dots \beta_{a+1} \right) \left(H_t \dots H_{a+1} \right) \vec k_t^T \vec v_t
 ```
 
 Luckily, there are people very good at math and find ways to compute $H_{a+1} \dots H_b$ without actually doing repeated matmuls. Assume
 
 ```math
-H_a \dots H_b = I - \sum_{t=a}^b \vec k_t \otimes \vec w_t
+H_a \dots H_b = I - \sum_{t=a}^b \vec w_t^T \vec k_t
 ```
 
 We don't know what $\vec w_t$ is yet, but we know it's a vector that we can compute. We prove this relation by induction. Consider $b=a$:
 
 ```math
-H_a = I - \vec k_a \otimes \vec w_a
+H_a = I - \vec w_a^T \vec k_a
 ```
 
-Which is correct by the definition of $H_t$, and if $\vec w_a = \beta_t \vec k_a$. Next, let's prove the inductive step.
+Which is correct by the definition of $H_t$, and if $\vec w_a = \beta_a \vec k_a$. Next, let's prove the inductive step.
 
 ```math
-H_a \dots H_b = \left(I - \sum_{t=a}^{b-1} \vec k_t \otimes \vec w_t\right) \left(I - \beta_b \vec k_b \otimes \vec k_b\right)
+H_a \dots H_b = \left(I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \left(I - \beta_b \vec k_b^T \vec k_b\right)
 ```
 
 ```math
-= I - \sum_{t=a}^{b-1} \vec k_t \otimes \vec w_t - \beta_b \vec k_b \otimes \vec k_b + \beta_b \left( \sum_{t=a}^{b-1} \vec k_t \otimes \vec w_t\right)\left(\vec k_b \otimes \vec k_b\right)
+= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \vec k_b^T \vec k_b + \beta_b \left( \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \vec k_b^T \vec k_b
+```
+
+```math
+= I - \left(\sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) - \beta_b \left(\vec k_b^T - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t \vec k_b^T\right) \vec k_b
+```
+
+```math
+= I - \left(\sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) - \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)^T \vec k_b
+```
+
+If we let $\vec w_b = \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)$, then everything works out correctly, though it feels like cheating! We can verify again that if we set $b=a$, the recursive relation of $\vec w_t$ also works out correctly.
+
+Before examining how we can compute $\vec w_t$ (it's still a recursive relation!), we can prove another fact about $S_t$.
+
+```math
+\sum_{t=a}^b \left(g_a \dots g_t \right) \left(H_a \dots H_t \right) \vec k_t^T \vec v_t = \sum_{t=a}^b \vec k_t^T \vec u_t
+```
+
+At $b=a$, we obtain $g_a H_a \vec k_a^T \vec v_a = \vec k_a^T \vec u_t$. 
+
+```math
+\sum_{t=a}^b \left(g_a \dots g_t \right) \left(H_a \dots H_t \right) \vec k_t^T \vec v_t = 
 ```
