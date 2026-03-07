@@ -161,7 +161,7 @@ S_t = g_t \left( g_{t-1} S_{t-2} + \vec k_{t-1}^T \vec v_{t-1} \right) + \vec k_
 = g_t g_{t-1} S_{t-2} + g_t \vec k_{t-1}^T \vec v_{t-1} + \vec k_t^T \vec v_t
 ```
 
-Generalizing it
+Generalizing it ($a \leq b$)
 
 ```math
 S_b = \left(g_b \dots g_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec v_t
@@ -218,10 +218,20 @@ S_t = g_t (I - \beta_t \vec k_t^T \vec k_t) S_{t-1} + \beta_t \vec k_t^T \vec v_
 Uh oh, the gating term now involves a matrix multiplication with the previous state. If we unroll the recursive relations N times, there will be N extra matrix multiplications. Defining $H_t = I - \beta_t \vec k_t^T \vec k_t$, we have (I'm using a random letter H here, not following any conventions):
 
 ```math
-S_b = \left(g_b \dots g_{a+1} \right) \left(H_b \dots H_{a+1} \right) S_a + \sum_{t=a+1}^b \left(\beta_t \dots \beta_{a+1} \right) \left(H_t \dots H_{a+1} \right) \vec k_t^T \vec v_t
+S_t = g_t H_t S_{t-1} + \beta_t \vec k_t^T \vec v_t
 ```
 
-Luckily, there are people very good at math and find ways to compute $H_{a+1} \dots H_b$ without actually doing repeated matmuls. Assume
+```math
+= g_t g_{t-1} H_t H_{t-1} S_{t-2} + g_t H_t \beta_{t-1} \vec k_{t-1}^T \vec v_{t-1} + \beta_t \vec k_t^T \vec v_t
+```
+
+Generalizing it ($a \leq b$)
+
+```math
+S_b = \left(g_b \dots g_{a+1} \right) \left(H_b \dots H_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t
+```
+
+Luckily, there are people very good at math and find ways to compute $H_a \dots H_b$ without actually doing repeated matmuls. Assume
 
 ```math
 H_a \dots H_b = I - \sum_{t=a}^b \vec w_t^T \vec k_t
@@ -240,27 +250,11 @@ H_a \dots H_b = \left(I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \left(I - 
 ```
 
 ```math
-= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \vec k_b^T \vec k_b + \beta_b \left( \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \vec k_b^T \vec k_b
+= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \left(I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \vec k_b^T \vec k_b
 ```
 
 ```math
-= I - \left(\sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) - \beta_b \left(\vec k_b^T - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t \vec k_b^T\right) \vec k_b
+= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \left[\vec k_b \left(I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t \right) \right]^T \vec k_b
 ```
 
-```math
-= I - \left(\sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) - \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)^T \vec k_b
-```
-
-If we let $\vec w_b = \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)$, then everything works out correctly, though it feels like cheating! We can verify again that if we set $b=a$, the recursive relation of $\vec w_t$ also works out correctly.
-
-Before examining how we can compute $\vec w_t$ (it's still a recursive relation!), we can prove another fact about $S_t$.
-
-```math
-\sum_{t=a}^b \left(g_a \dots g_t \right) \left(H_a \dots H_t \right) \vec k_t^T \vec v_t = \sum_{t=a}^b \vec k_t^T \vec u_t
-```
-
-At $b=a$, we obtain $g_a H_a \vec k_a^T \vec v_a = \vec k_a^T \vec u_t$. 
-
-```math
-\sum_{t=a}^b \left(g_a \dots g_t \right) \left(H_a \dots H_t \right) \vec k_t^T \vec v_t = 
-```
+If we let $\vec w_b = \beta_b \vec k_b \left(I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t\right)$, then everything works out correctly, though it feels like cheating! We can verify again that if we set $b=a$, the recursive relation of $\vec w_t$ also works out correctly.
