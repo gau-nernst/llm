@@ -217,10 +217,6 @@ Let's group all the terms involving the previous state together.
 S_t = g_t (I - \beta_t \vec k_t^T \vec k_t) S_{t-1} + \beta_t \vec k_t^T \vec v_t
 ```
 
-```math
-
-```
-
 Uh oh, the gating term now involves a matrix multiplication with the previous state. If we unroll the recursive relations N times, there will be N extra matrix multiplications. Defining $H_t = I - \beta_t \vec k_t^T \vec k_t$, we have (I'm using a random letter H here, not following any conventions):
 
 ```math
