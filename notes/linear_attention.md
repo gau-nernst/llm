@@ -167,10 +167,6 @@ Generalizing it ($a \leq b$)
 S_b = \left(g_b \dots g_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec v_t
 ```
 
-```math
-= \left(g_b \dots g_{a+1} \right) S_a + \left(g_b \cdots g_{a+1}\right) \sum_{t=a+1}^b \left(\frac{1}{g_t \cdots g_{a+1}}\right) \vec k_t^T \vec v_t
-```
-
 The cumulative gating factor is a bit annoying, but I suppose it's not the end of the world. We can compute the cumulative product first, divide keys by it, then use the tensor cores as usual.
 
 One note on numerical stability. Multiplying a lot of <1 numbers together is usually not a good idea. We can use the well-known log trick.
@@ -188,14 +184,24 @@ To compute the output
 ```
 
 ```math
-= \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{a+1} \right) \vec q_b \left(\frac{1}{g_t \cdots g_{a+1}}\right) \vec k_t^T \vec v_t
+= \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right)  \vec q_b \vec k_t^T \vec v_t
 ```
 
-Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the dot product $\vec q_b \vec k_t^T$ (ignoring the extra scaling). We can pre-multiply $\vec q_b$ with the cumulative product $\left(g_b \cdots g_{a+1}\right)$ (notice the product goes from $a+1$ to $b$ for query at $b$), and pre-divide $\vec k_t^T$ with the cumulative product $\left(g_t \cdots g_{a+1}\right)$ (notice the product goes from $a+1$ to $t$ for key at $t$). This is good because we can do this pre-multiplication for all queries (and pre-division for all keys) in parallel (after obtaining the cumulative product).
+Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the dot product $\vec q_b \vec k_t^T$ (ignoring the extra scaling). For the 1st term, we can pre-multiply $\vec q_b$ with the cumulative product $\left(g_b \cdots g_{a+1}\right)$ (notice the product goes from $a+1$ to $b$ for query at $b$). For the 2nd term, we can pre-multiply $\vec k_t$ with $\left(g_b \cdots g_{t+1}\right)$. This is good because we can do this pre-multiplication for all queries and keys in parallel, after obtaining the cumulative product, and before the main MMA.
 
 Next, we stack multiple consecutive queries together to form a matrix multiplication:
-- The first term becomes `(G * Q) @ S`, where `G * Q` is the scaled queries computed in parallel.
-- The second term becomes `((G * Q) @ (1/G * K).T) * M) @ V`, where `1/G * K` is the scaled keys computed in parallel, and M is the causal mask.
+
+```
+Q' = G * Q
+K' = (G[-1] / G) * K
+
+S = G[-1] * S + K'.T @ V
+O = Q' @ S + ((Q @ K'.T) * M) @ V
+```
+
+- `G` is the cumulative product, shape `[BT, 1]`
+- `(G * Q)` and `(G[-1] / G) * K` are scaled queries and keys, computed in parallel.
+- `M` is the causal mask.
 
 ## Gated DeltaNet: Parallel Computation
 
@@ -231,30 +237,109 @@ Generalizing it ($a \leq b$)
 S_b = \left(g_b \dots g_{a+1} \right) \left(H_b \dots H_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t
 ```
 
-Luckily, there are people very good at math and find ways to compute $H_a \dots H_b$ without actually doing repeated matmuls. Assume
+Luckily, there are people very good at math and find ways to compute $H_b \dots H_a$ without actually doing repeated matmuls. Assume
 
 ```math
-H_a \dots H_b = I - \sum_{t=a}^b \vec w_t^T \vec k_t
+H_b \dots H_a = I - \sum_{t=a}^b \vec k_t^T \vec w_t
 ```
 
 We don't know what $\vec w_t$ is yet, but we know it's a vector that we can compute. We prove this relation by induction. Consider $b=a$:
 
 ```math
-H_a = I - \vec w_a^T \vec k_a
+H_a = I - \vec k_a^T \vec w_a
 ```
 
 Which is correct by the definition of $H_t$, and if $\vec w_a = \beta_a \vec k_a$. Next, let's prove the inductive step.
 
 ```math
-H_a \dots H_b = \left(I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \left(I - \beta_b \vec k_b^T \vec k_b\right)
+H_b \dots H_a = \left(I - \beta_b \vec k_b^T \vec k_b\right) \left(I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t\right)
 ```
 
 ```math
+= I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t - \beta_b \vec k_b^T \vec k_b \left(I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t\right)
+```
+
+```math
+= I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t - \vec k_b^T \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)
+```
+
+<!-- ```math
 = I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \left(I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \vec k_b^T \vec k_b
 ```
 
 ```math
-= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \left[\vec k_b \left(I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t \right) \right]^T \vec k_b
+= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t \right)^T \vec k_b
+``` -->
+
+If we let $\vec w_b = \beta_b \left( \vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)$, then everything works out correctly, though it feels like cheating! Note that $\vec k_b \vec k_t^T$ is a dot product. We can verify again that if we set $b=a$, the recursive relation of $\vec w_t$ also works out correctly.
+
+We want to prove the following (2nd term in $S_b$ equation, ignoring the gating factors), and also find the recurrent relation for $\vec u$
+
+```math
+\sum_{t=a}^b \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t = \sum_{t=a}^b \vec k_t^T \vec u_t
 ```
 
-If we let $\vec w_b = \beta_b \vec k_b \left(I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t\right)$, then everything works out correctly, though it feels like cheating! We can verify again that if we set $b=a$, the recursive relation of $\vec w_t$ also works out correctly.
+At $b=a$, we get $\vec u_a = \beta_a \vec v_a$. Proving the inductive step
+
+```math
+\sum_{t=a}^b \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t
+```
+
+```math
+= H_b \sum_{t=a}^{b-1} \left(H_{b-1} \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t + \beta_b \vec k_b^T \vec v_b
+```
+
+```math
+= (I - \beta_b \vec k_b^T \vec k_b) \sum_{t=a}^{b-1} \vec k_t^T \vec u_t + \beta_b \vec k_b^T \vec v_b
+```
+
+```math
+= \sum_{t=a}^{b-1} \vec k_t^T \vec u_t + \vec k_b^T \beta_b \left(\vec v_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec u_t\right)
+```
+
+Hence, by setting $\vec u_b = \beta_b \left(\vec v_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec u_t\right)$, the relation is correct. Note that this is very similar to the recurrent relation for $\vec w$.
+
+Looking at the original equation again, we can drop the summation
+
+```math
+\left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t = \vec k_t^T \vec u_t
+```
+
+You may want to ask, why we didn't prove this relation directly. The problem is that we can't obtain the recurrent relation for $\vec u$ this way. Anyway, now we can put everything back to the state update equation.
+
+```math
+S_b = \left(g_b \dots g_{a+1} \right) \left(I - \sum_{t=a+1}^b \vec k_t^T \vec w_t \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec u_t
+```
+
+To make the calculations nicer, the author distribute the gating scales to $\vec k$ and $\vec w$ in the first term.
+
+```math
+S_b = \left(g_b \dots g_{a+1} \right) S_b - \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \left(g_t \cdots g_{a+1} \right) \vec w_t S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec u_t
+```
+
+```math
+= \left(g_b \dots g_{a+1} \right) S_b + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \left[\vec u_t - \left(g_t \cdots g_{a+1} \right) \vec w_t S_a\right]
+```
+
+Hence, the scaled keys are shared between the 2nd and 3rd terms. Stacking multiple $\vec w$ and $\vec u$ together, we obtain a nice matrix equation
+
+```
+K' = (G[-1] / G) * K
+W' = G * W
+S = G[-1] * S + K'.T @ (U - W' @ S)
+```
+
+To compute the output
+
+```math
+\vec q_b S_b = \left(g_b \dots g_{a+1} \right) \vec q_b S_b + \sum_{t=a+1}^b \vec q_b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \left[\vec u_t - \left(g_t \cdots g_{a+1} \right) \vec w_t S_a\right]
+```
+
+In matrix form
+
+```
+Q' = G * Q
+O = Q' @ S + ((Q @ K') * M) @ (U - W' @ S)
+```
+
+Note: looks like the equations we have derived are slightly different from the author's because our $\vec u$ recurrent equations are different in the Gated version. Hopefully it's still correct...
