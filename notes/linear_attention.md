@@ -143,6 +143,76 @@ for t in range(0, T, BLOCK_T):
 
 When we have sufficiently large batch size (number of attention heads is fixed), the GPU should be well-utilized.
 
+<details>
+<summary>Tile implementation in PyTorch</summary>
+
+```python
+import torch
+from torch import Tensor
+
+
+def la_recurrent(
+    Q: Tensor,  # (num_tokens, qk_dim)
+    K: Tensor,  # (num_tokens, qk_dim)
+    V: Tensor,  # (num_tokens, v_dim)
+    state: Tensor,  # (v_dim, qk_dim)
+):
+    num_tokens, _ = Q.shape
+    out = torch.empty_like(V)
+
+    for t in range(num_tokens):
+        q_vec = Q[t : t + 1]  # row vectors
+        k_vec = K[t : t + 1]
+        v_vec = V[t : t + 1]
+
+        state = state + v_vec.T @ k_vec  # outer product
+        out[t : t + 1] = q_vec @ state.T
+
+    return state, out
+
+
+def la_parallel(
+    Q: Tensor,  # (num_tokens, qk_dim)
+    K: Tensor,  # (num_tokens, qk_dim)
+    V: Tensor,  # (num_tokens, v_dim)
+    state: Tensor,  # (v_dim, qk_dim)
+    BLOCK_T: int = 16,
+):
+    num_tokens, _ = Q.shape
+    assert num_tokens % BLOCK_T == 0
+
+    out = torch.empty_like(V)
+    mask = torch.tril(torch.ones(BLOCK_T, BLOCK_T))
+
+    for t in range(0, num_tokens, BLOCK_T):
+        q_tile = Q[t : t + BLOCK_T]
+        k_tile = K[t : t + BLOCK_T]
+        v_tile = V[t : t + BLOCK_T]
+
+        out[t : t + BLOCK_T] = q_tile @ state.T + (q_tile @ k_tile.T * mask) @ v_tile
+        state = state + v_tile.T @ k_tile
+
+    return state, out
+
+
+num_tokens = 64
+qk_dim = 64
+v_dim = 96
+
+Q = torch.randn(num_tokens, qk_dim)
+K = torch.randn(num_tokens, qk_dim) * (qk_dim**-0.5)
+V = torch.randn(num_tokens, v_dim)
+state = torch.randn(v_dim, qk_dim)
+
+state_re, out_re = la_recurrent(Q, K, V, state)
+state_pa, out_pa = la_parallel(Q, K, V, state)
+
+torch.testing.assert_close(state_pa, state_re)
+torch.testing.assert_close(out_pa, out_re)
+```
+
+</details>
+
 ### Parallel Computation for Gated Linear Attention
 
 Update rule of Gated Linear Attention
@@ -167,7 +237,7 @@ Generalizing it ($a \leq b$)
 S_b = \left(g_b \dots g_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec v_t
 ```
 
-The cumulative gating factor is a bit annoying, but I suppose it's not the end of the world. We can compute the cumulative product first, divide keys by it, then use the tensor cores as usual.
+The cumulative gating factor is a bit annoying, but I suppose it's not the end of the world. Note that the scales vary along the reduction dim, hence we can only pre-apply this scaling to the inputs ($\vec k$ in this case) to convert this to a matmul.
 
 One note on numerical stability. Multiplying a lot of <1 numbers together is usually not a good idea. We can use the well-known log trick.
 
@@ -184,24 +254,116 @@ To compute the output
 ```
 
 ```math
-= \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right)  \vec q_b \vec k_t^T \vec v_t
+= \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1}\right) \vec q_b \vec k_t^T \vec v_t
 ```
 
-Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the dot product $\vec q_b \vec k_t^T$ (ignoring the extra scaling). For the 1st term, we can pre-multiply $\vec q_b$ with the cumulative product $\left(g_b \cdots g_{a+1}\right)$ (notice the product goes from $a+1$ to $b$ for query at $b$). For the 2nd term, we can pre-multiply $\vec k_t$ with $\left(g_b \cdots g_{t+1}\right)$. This is good because we can do this pre-multiplication for all queries and keys in parallel, after obtaining the cumulative product, and before the main MMA.
+Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the dot product $\vec q_b \vec k_t^T$ (ignoring the extra scaling).
+- For the 1st term, we can either pre-multiply $\vec q_b$ or post-multiply the result $\vec q_b S_a$.
+- For the 2nd term, it's a bit more complicated: the scaling depends on the relative position between query and key vectors - key stays at $t$, and query stays at $b$. Again, we have to fuse this scaling to the inputs ($\vec q$ or $\vec k$) because the scales vary along the reduction dim. We can re-write the output equation as:
+
+```math
+\vec o_b = \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \cdots g_{a+1}\right)} \vec k_t^T \vec v_t
+```
+
+Ok so now we can pre-scale queries and keys. There might be problems with scaling the keys when $b-a$ is large, as we are dividing keys by a small number.
 
 Next, we stack multiple consecutive queries together to form a matrix multiplication:
 
 ```
 Q' = G * Q
-K' = (G[-1] / G) * K
+K' = (1 / G) * K
 
-S = G[-1] * S + K'.T @ V
-O = Q' @ S + ((Q @ K'.T) * M) @ V
+S = G[-1] * (S + K'.T @ V)
+O = Q' @ S + ((Q' @ K'.T) * M) @ V
 ```
 
 - `G` is the cumulative product, shape `[BT, 1]`
-- `(G * Q)` and `(G[-1] / G) * K` are scaled queries and keys, computed in parallel.
+- `(G * Q)` and `(1 / G) * K` are scaled queries and keys, computed in parallel.
 - `M` is the causal mask.
+
+
+<details>
+<summary>Tile implementation in PyTorch</summary>
+
+```python
+import torch
+from torch import Tensor
+
+def gla_recurrent(
+    Q: Tensor,  # (num_tokens, qk_dim)
+    K: Tensor,  # (num_tokens, qk_dim)
+    V: Tensor,  # (num_tokens, v_dim)
+    gate: Tensor,  # (num_tokens)
+    state: Tensor,  # (v_dim, qk_dim)
+):
+    num_tokens, _ = Q.shape
+    out = torch.empty_like(V)
+
+    for t in range(num_tokens):
+        q_vec = Q[t : t + 1]  # row vectors
+        k_vec = K[t : t + 1]
+        v_vec = V[t : t + 1]
+        g = gate[t].exp()
+
+        state = g * state + v_vec.T @ k_vec  # outer product
+        out[t : t + 1] = q_vec @ state.T
+
+    return state, out
+
+
+def gla_parallel(
+    Q: Tensor,  # (num_tokens, qk_dim)
+    K: Tensor,  # (num_tokens, qk_dim)
+    V: Tensor,  # (num_tokens, v_dim)
+    gate: Tensor,  # (num_tokens)
+    state: Tensor,  # (v_dim, qk_dim)
+    BLOCK_T: int = 16,
+):
+    num_tokens, _ = Q.shape
+    assert num_tokens % BLOCK_T == 0
+
+    mask = torch.tril(torch.ones(BLOCK_T, BLOCK_T))
+    out = torch.empty_like(V)
+
+    # pre-apply gating for q and k
+    # per-tile cumsum
+    cu_gate = gate.view(-1, BLOCK_T).cumsum(dim=1).flatten(0, 1)
+
+    Q_scaled = Q * cu_gate.unsqueeze(-1).exp()
+    K_scaled = K * (-cu_gate).unsqueeze(-1).exp()
+
+    for t in range(0, num_tokens, BLOCK_T):
+        q_tile = Q_scaled[t : t + BLOCK_T]
+        k_tile = K_scaled[t : t + BLOCK_T]
+        v_tile = V[t : t + BLOCK_T]
+
+        out[t : t + BLOCK_T] = q_tile @ state.T + (q_tile @ k_tile.T * mask) @ v_tile
+
+        # last element in tile cumsum = tile sum
+        g = cu_gate[t + BLOCK_T - 1].exp()
+        state = g * (state + v_tile.T @ k_tile)
+
+    return state, out
+
+
+num_tokens = 256
+qk_dim = 64
+v_dim = 96
+
+Q = torch.randn(num_tokens, qk_dim)
+K = torch.randn(num_tokens, qk_dim) * (qk_dim**-0.5)
+V = torch.randn(num_tokens, v_dim)
+gate = torch.rand(num_tokens).log()
+state = torch.randn(v_dim, qk_dim)
+
+state_re, out_re = gla_recurrent(Q, K, V, gate, state)
+state_pa, out_pa = gla_parallel(Q, K, V, gate, state)
+
+torch.testing.assert_close(state_pa, state_re)
+torch.testing.assert_close(out_pa, out_re)
+```
+
+</details>
 
 ## Gated DeltaNet: Parallel Computation
 
@@ -259,83 +421,188 @@ H_b \dots H_a = \left(I - \beta_b \vec k_b^T \vec k_b\right) \left(I - \sum_{t=a
 = I - \sum_{t=a}^{b-1} \vec k_t^T \vec w_t - \vec k_b^T \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)
 ```
 
-<!-- ```math
-= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \left(I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t\right) \vec k_b^T \vec k_b
-```
-
-```math
-= I - \sum_{t=a}^{b-1} \vec w_t^T \vec k_t - \beta_b \left(\vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t \right)^T \vec k_b
-``` -->
-
 If we let $\vec w_b = \beta_b \left( \vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec w_t\right)$, then everything works out correctly, though it feels like cheating! Note that $\vec k_b \vec k_t^T$ is a dot product. We can verify again that if we set $b=a$, the recursive relation of $\vec w_t$ also works out correctly.
 
-We want to prove the following (2nd term in $S_b$ equation, ignoring the gating factors), and also find the recurrent relation for $\vec u$
+We want to prove the following (2nd term in $S_b$ equation), and also find the recurrent relation for $\vec u$
 
 ```math
-\sum_{t=a}^b \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t = \sum_{t=a}^b \vec k_t^T \vec u_t
+\sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t = \sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec u_t
 ```
 
 At $b=a$, we get $\vec u_a = \beta_a \vec v_a$. Proving the inductive step
 
 ```math
-\sum_{t=a}^b \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t
+\sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t
 ```
 
 ```math
-= H_b \sum_{t=a}^{b-1} \left(H_{b-1} \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t + \beta_b \vec k_b^T \vec v_b
+= g_b H_b \sum_{t=a}^{b-1} \left(g_{b-1} \dots g_{t+1}\right) \left(H_{b-1} \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t + \beta_b \vec k_b^T \vec v_b
 ```
 
 ```math
-= (I - \beta_b \vec k_b^T \vec k_b) \sum_{t=a}^{b-1} \vec k_t^T \vec u_t + \beta_b \vec k_b^T \vec v_b
+= g_b (I - \beta_b \vec k_b^T \vec k_b) \sum_{t=a}^{b-1} \left(g_{b-1} \dots g_{t+1}\right) \vec k_t^T \vec u_t + \beta_b \vec k_b^T \vec v_b
 ```
 
 ```math
-= \sum_{t=a}^{b-1} \vec k_t^T \vec u_t + \vec k_b^T \beta_b \left(\vec v_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec u_t\right)
+= \sum_{t=a}^{b-1} \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec u_t + \vec k_b^T \beta_b \left(\vec v_b - \sum_{t=a}^{b-1} \left(g_b \dots g_{t+1}\right) \vec k_b \vec k_t^T \vec u_t\right)
 ```
 
-Hence, by setting $\vec u_b = \beta_b \left(\vec v_b - \sum_{t=a}^{b-1} \vec k_b \vec k_t^T \vec u_t\right)$, the relation is correct. Note that this is very similar to the recurrent relation for $\vec w$.
+Hence, by setting $\vec u_b = \beta_b \left(\vec v_b - \sum_{t=a}^{b-1} \left(g_b \dots g_{t+1}\right) \vec k_b \vec k_t^T \vec u_t\right)$, the relation is correct. Note that this is very similar to the recurrent relation for $\vec w$. Also pay attention that the inner cumulative product is from $t+1$ to $b$, while the outer summation is only up to $b-1$.
 
-Looking at the original equation again, we can drop the summation
+Putting everything back to the state update equation.
 
 ```math
-\left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t = \vec k_t^T \vec u_t
+S_b = \left(g_b \dots g_{a+1}\right) \left(I - \sum_{t=a+1}^b \vec k_t^T \vec w_t \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1}\right) \vec k_t^T \vec u_t
 ```
 
-You may want to ask, why we didn't prove this relation directly. The problem is that we can't obtain the recurrent relation for $\vec u$ this way. Anyway, now we can put everything back to the state update equation.
+Rewritting this a bit for parallel computations
 
 ```math
-S_b = \left(g_b \dots g_{a+1} \right) \left(I - \sum_{t=a+1}^b \vec k_t^T \vec w_t \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec u_t
+S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \left(\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a\right)\right]
 ```
 
-To make the calculations nicer, the author distribute the gating scales to $\vec k$ and $\vec w$ in the first term.
+We can scaled $\vec k$ and $\vec w$ appropriately before the computation. For the output:
 
 ```math
-S_b = \left(g_b \dots g_{a+1} \right) S_b - \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \left(g_t \cdots g_{a+1} \right) \vec w_t S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec u_t
+\vec o_b = \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \left(\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a\right)
 ```
 
-```math
-= \left(g_b \dots g_{a+1} \right) S_b + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \left[\vec u_t - \left(g_t \cdots g_{a+1} \right) \vec w_t S_a\right]
-```
-
-Hence, the scaled keys are shared between the 2nd and 3rd terms. Stacking multiple $\vec w$ and $\vec u$ together, we obtain a nice matrix equation
-
-```
-K' = (G[-1] / G) * K
-W' = G * W
-S = G[-1] * S + K'.T @ (U - W' @ S)
-```
-
-To compute the output
-
-```math
-\vec q_b S_b = \left(g_b \dots g_{a+1} \right) \vec q_b S_b + \sum_{t=a+1}^b \vec q_b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \left[\vec u_t - \left(g_t \cdots g_{a+1} \right) \vec w_t S_a\right]
-```
-
-In matrix form
+Similarly, $\vec q$ can be scaled accordingly. Stacking the row vectors together, we obtain the matrix form:
 
 ```
 Q' = G * Q
-O = Q' @ S + ((Q @ K') * M) @ (U - W' @ S)
+K' = (1 / G) * K
+W' = G * W
+
+S = G[-1] * (S + K'.T @ (U - W' @ S))
+O = Q' @ S + ((Q' @ K'.T) * M) @ (U - W' @ S)
 ```
 
 Note: looks like the equations we have derived are slightly different from the author's because our $\vec u$ recurrent equations are different in the Gated version. Hopefully it's still correct...
+
+Comparing with the Gated Linear Attention equations, this looks very similar, with `V` being replaced with `U - W' @ S`.
+
+```
+V' = U - W' @ S
+S = G[-1] * (S + K'.T @ V')
+O = Q' @ S + ((Q' @ K'.T) * M) @ V'
+```
+
+### Compute w and u
+
+The last piece is how to compute $\vec w$ and $\vec u$ efficiently in parallel. The author provides these equations, in which perhaps we just take it at the face value.
+
+```
+T = B * (I + strictLower(B * K @ K.T))^(-1)
+W = T @ K
+U = T @ V
+```
+
+Size of `T` is `[BLOCK_T, BLOCK_T]`, so with sufficiently small `BLOCK_T`, calculting the inverse might not be too slow? [FLA repo](https://github.com/fla-org/flash-linear-attention/blob/v0.4.1/fla/ops/gated_delta_rule/chunk.py#L27) uses `BLOCK_T=64`.
+
+<details>
+<summary>Tile implementation in PyTorch</summary>
+
+```python
+import torch
+from torch import Tensor
+
+def gdn_recurrent(
+    Q: Tensor,  # (num_tokens, qk_dim)
+    K: Tensor,  # (num_tokens, qk_dim)
+    V: Tensor,  # (num_tokens, v_dim)
+    gate: Tensor,  # (num_tokens)
+    beta: Tensor,  # (num_tokens)
+    state: Tensor,  # (v_dim, qk_dim)
+):
+    num_tokens, _ = Q.shape
+    out = torch.empty_like(V)
+
+    for t in range(num_tokens):
+        q_vec = Q[t : t + 1]  # row vectors
+        k_vec = K[t : t + 1]
+        v_vec = V[t : t + 1]
+        g = gate[t].exp()
+        b = beta[t]
+
+        v_err = v_vec - g * k_vec @ state.T
+        state = g * state + b * v_err.T @ k_vec  # outer product
+
+        out[t : t + 1] = q_vec @ state.T
+
+    return state, out
+
+
+def gdn_parallel(
+    Q: Tensor,  # (num_tokens, qk_dim)
+    K: Tensor,  # (num_tokens, qk_dim)
+    V: Tensor,  # (num_tokens, v_dim)
+    gate: Tensor,  # (num_tokens)
+    beta: Tensor,  # (num_tokens)
+    state: Tensor,  # (v_dim, qk_dim)
+    BLOCK_T: int = 16,
+):
+    num_tokens, _ = Q.shape
+    assert num_tokens % BLOCK_T == 0
+
+    mask = torch.tril(torch.ones(BLOCK_T, BLOCK_T))
+    out = torch.empty_like(V)
+
+    # per-tile cumsum
+    cu_gate = gate.view(-1, BLOCK_T).cumsum(dim=1)
+
+    # compute W and U before the main kernel
+    K_tiles = K.unflatten(0, (-1, BLOCK_T))  # (num_blocks, BLOCK_T, qk_dim)
+    V_tiles = V.unflatten(0, (-1, BLOCK_T))
+    beta_tiles = beta.view(-1, BLOCK_T, 1)
+
+    # just follow the equation...
+    GAMMA = (cu_gate.unsqueeze(2) - cu_gate.unsqueeze(1)).exp()  # (num_blocks, BLOCK_T, BLOCK_T)
+    eye = torch.eye(BLOCK_T)
+
+    T_W = eye + (beta_tiles * K_tiles @ K_tiles.transpose(1, 2)).tril(-1)
+    W = torch.linalg.solve(T_W, beta_tiles * K_tiles).reshape(num_tokens, -1)
+
+    T_U = eye + (beta_tiles * GAMMA * (K_tiles @ K_tiles.transpose(1, 2))).tril(-1)
+    U = torch.linalg.solve(T_U, beta_tiles * V_tiles).reshape(num_tokens, -1)
+
+    # pre-apply gating for q, k, and w
+    Q_scaled = Q * cu_gate.view(-1, 1).exp()
+    K_scaled = K * (-cu_gate).view(-1, 1).exp()
+    W_scaled = W * cu_gate.view(-1, 1).exp()
+
+    for t in range(0, num_tokens, BLOCK_T):
+        q_tile = Q_scaled[t : t + BLOCK_T]
+        k_tile = K_scaled[t : t + BLOCK_T]
+        w_tile = W_scaled[t : t + BLOCK_T]
+        u_tile = U[t : t + BLOCK_T]
+
+        v_err = u_tile - w_tile @ state.T
+        out[t : t + BLOCK_T] = q_tile @ state.T + (q_tile @ k_tile.T * mask) @ v_err
+
+        # last element in tile cumsum = tile sum
+        g = cu_gate[t // BLOCK_T, -1].exp()
+        state = g * (state + v_err.T @ k_tile)
+
+    return state, out
+
+
+num_tokens = 16 * 5
+qk_dim = 64
+v_dim = 96
+
+Q = torch.randn(num_tokens, qk_dim)
+K = torch.randn(num_tokens, qk_dim) * (qk_dim**-0.5)
+V = torch.randn(num_tokens, v_dim)
+gate = torch.rand(num_tokens).log()
+beta = torch.randn(num_tokens)
+state = torch.randn(v_dim, qk_dim)
+
+state_re, out_re = gdn_recurrent(Q, K, V, gate, beta, state)
+state_pa, out_pa = gdn_parallel(Q, K, V, gate, beta, state, BLOCK_T=16)
+
+torch.testing.assert_close(state_pa, state_re)
+torch.testing.assert_close(out_pa, out_re)
+```
+
+</details>
