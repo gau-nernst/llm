@@ -259,19 +259,19 @@ To compute the output
 
 Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the dot product $\vec q_b \vec k_t^T$ (ignoring the extra scaling).
 - For the 1st term, we can either pre-multiply $\vec q_b$ or post-multiply the result $\vec q_b S_a$.
-- For the 2nd term, it's a bit more complicated: the scaling depends on the relative position between query and key vectors - key stays at $t$, and query stays at $b$. Again, we have to fuse this scaling to the inputs ($\vec q$ or $\vec k$) because the scales vary along the reduction dim. We can re-write the output equation as:
+- For the 2nd term, it's a bit more complicated: the scaling depends on the relative position between query and key vectors - key stays at $t$, and query stays at $b$. We can re-write the output equation as:
 
 ```math
 \vec o_b = \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \cdots g_{a+1}\right)} \vec k_t^T \vec v_t
 ```
 
-Ok so now we can pre-scale queries and keys. There might be problems with scaling the keys when $b-a$ is large, as we are dividing keys by a small number.
+We can either pre-scale queries and keys, OR post-scale `Q @ K.T`. Notice that `Q @ K.T` is doing reduction along the `qk_dim`, so scaling along the `BLOCK_T` dim can be fused at output.
 
-Next, we stack multiple consecutive queries together to form a matrix multiplication:
+Next, we stack multiple consecutive queries together to form a matrix multiplication. First, look at the pre-scaling approach.
 
 ```
 Q' = G * Q
-K' = (1 / G) * K
+K' = (1/G) * K
 
 S = G[-1] * (S + K'.T @ V)
 O = Q' @ S + ((Q' @ K'.T) * M) @ V
@@ -281,6 +281,16 @@ O = Q' @ S + ((Q' @ K'.T) * M) @ V
 - `(G * Q)` and `(1 / G) * K` are scaled queries and keys, computed in parallel.
 - `M` is the causal mask.
 
+There is a problem with input scaling with tensor cores: typically we want a fast loop of gmem->smem then MMA. If we need to scale the inputs in the same kernel, it can leave the MMA pipeline idle (BF16 -> FP32 -> scale -> BF16). One way to solve this is to have a separate pre-scaling kernel, so that data in gmem is already scaled.
+
+A possibly better way is that we can scale **MMA output** instead, which is already in FP32.
+
+```
+M' = (1/G) * M
+O = G[-1] * (Q @ S + ((Q @ K.T) * M') @ V)
+```
+
+Notice that we have fused scaling of `K` to the causal mask `M`. For `S` equation, we can't avoid input pre-scaling.
 
 <details>
 <summary>Tile implementation in PyTorch</summary>
@@ -321,27 +331,21 @@ def gla_parallel(
 ):
     num_tokens, _ = Q.shape
     assert num_tokens % BLOCK_T == 0
-
     mask = torch.tril(torch.ones(BLOCK_T, BLOCK_T))
     out = torch.empty_like(V)
 
-    # pre-apply gating for q and k
-    # per-tile cumsum
-    cu_gate = gate.view(-1, BLOCK_T).cumsum(dim=1).flatten(0, 1)
-
-    Q_scaled = Q * cu_gate.unsqueeze(-1).exp()
-    K_scaled = K * (-cu_gate).unsqueeze(-1).exp()
-
     for t in range(0, num_tokens, BLOCK_T):
-        q_tile = Q_scaled[t : t + BLOCK_T]
-        k_tile = K_scaled[t : t + BLOCK_T]
+        q_tile = Q[t : t + BLOCK_T]
+        k_tile = K[t : t + BLOCK_T]
         v_tile = V[t : t + BLOCK_T]
+        g_tile = gate[t : t + BLOCK_T].view(-1, 1)
 
-        out[t : t + BLOCK_T] = q_tile @ state.T + (q_tile @ k_tile.T * mask) @ v_tile
+        cu_gate = g_tile.cumsum(dim=0).exp()
+        scaled_mask = mask / cu_gate.view(1, -1)
+        out[t : t + BLOCK_T] = cu_gate * (q_tile @ state.T + ((q_tile @ k_tile.T) * scaled_mask) @ v_tile)
 
         # last element in tile cumsum = tile sum
-        g = cu_gate[t + BLOCK_T - 1].exp()
-        state = g * (state + v_tile.T @ k_tile)
+        state = cu_gate[-1] * (state + v_tile.T @ (k_tile / cu_gate))
 
     return state, out
 
@@ -461,44 +465,57 @@ Rewritting this a bit for parallel computations
 S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \left(\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a\right)\right]
 ```
 
-We can scaled $\vec k$ and $\vec w$ appropriately before the computation. For the output:
+Notice that this looks very similar to GLA's equations, with $\vec v_t$ being replaced with $\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a$. Hence, we can define this expression as $\vec v_t' = \vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a$
 
 ```math
-\vec o_b = \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \left(\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a\right)
+S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \vec v_t'\right]
 ```
 
-Similarly, $\vec q$ can be scaled accordingly. Stacking the row vectors together, we obtain the matrix form:
+For the output:
+
+```math
+\vec o_b = \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \vec v_t'
+```
+
+Similar to GLA, we can either pre-scale the inputs, or post-scale MMA outputs. Looking at the matrix form of input pre-scaling approach.
 
 ```
 Q' = G * Q
 K' = (1 / G) * K
 W' = G * W
-
-S = G[-1] * (S + K'.T @ (U - W' @ S))
-O = Q' @ S + ((Q' @ K'.T) * M) @ (U - W' @ S)
-```
-
-Note: looks like the equations we have derived are slightly different from the author's because our $\vec u$ recurrent equations are different in the Gated version. Hopefully it's still correct...
-
-Comparing with the Gated Linear Attention equations, this looks very similar, with `V` being replaced with `U - W' @ S`.
-
-```
 V' = U - W' @ S
+
 S = G[-1] * (S + K'.T @ V')
 O = Q' @ S + ((Q' @ K'.T) * M) @ V'
 ```
 
-### Compute w and u
+Note: looks like the equations we have derived are slightly different from the author's. Hopefully it's still correct...
 
-The last piece is how to compute $\vec w$ and $\vec u$ efficiently in parallel. The author provides these equations, in which perhaps we just take it at the face value.
+For the MMA output post-scaling approach.
 
 ```
-T = B * (I + strictLower(B * K @ K.T))^(-1)
-W = T @ K
-U = T @ V
+V' = U - G * (W @ S)
+M' = (1/G) * M
+
+S = G[-1] * (S + K.T @ ((1/G) * V'))
+O = G * (Q @ S + ((Q @ K.T) * M') @ V')
 ```
 
-Size of `T` is `[BLOCK_T, BLOCK_T]`, so with sufficiently small `BLOCK_T`, calculting the inverse might not be too slow? [FLA repo](https://github.com/fla-org/flash-linear-attention/blob/v0.4.1/fla/ops/gated_delta_rule/chunk.py#L27) uses `BLOCK_T=64`.
+Notice that in state update equation, we fuse `(1/G)` to `V'`. This is ok since `V'` is originally computed in FP32 (1st line), hence adding this scaling won't incur too much overheads.
+
+**Compute w and u.** The last piece is how to compute $\vec w$ and $\vec u$ efficiently in parallel. The author provides these equations, in which perhaps we just take it at the face value.
+
+```
+T_W = (I + strictLower(B * (K @ K.T)))^(-1)
+W = T_W @ (B * K)
+
+T_U = (I + strictLower(B * Gamma * (K @ K.T)))^(-1)
+U = T_U @ (B * V)
+```
+
+Size of `T_W` and `T_U` is `[BLOCK_T, BLOCK_T]`, so with sufficiently small `BLOCK_T`, calculting the inverse might not be too slow? [FLA repo](https://github.com/fla-org/flash-linear-attention/blob/v0.4.1/fla/ops/gated_delta_rule/chunk.py#L27) uses `BLOCK_T=64`.
+
+`Gamma` is a `[BLOCK_T, BLOCK_T]` matrix that encodes cumulative product of gate scales. It's defined as `Gamma[i,j] = cumprod(g[:i]) / cumprod(g[:j])`.
 
 <details>
 <summary>Tile implementation in PyTorch</summary>
@@ -546,43 +563,32 @@ def gdn_parallel(
     assert num_tokens % BLOCK_T == 0
 
     mask = torch.tril(torch.ones(BLOCK_T, BLOCK_T))
+    eye = torch.eye(BLOCK_T)
     out = torch.empty_like(V)
 
-    # per-tile cumsum
-    cu_gate = gate.view(-1, BLOCK_T).cumsum(dim=1)
-
-    # compute W and U before the main kernel
-    K_tiles = K.unflatten(0, (-1, BLOCK_T))  # (num_blocks, BLOCK_T, qk_dim)
-    V_tiles = V.unflatten(0, (-1, BLOCK_T))
-    beta_tiles = beta.view(-1, BLOCK_T, 1)
-
-    # just follow the equation...
-    GAMMA = (cu_gate.unsqueeze(2) - cu_gate.unsqueeze(1)).exp()  # (num_blocks, BLOCK_T, BLOCK_T)
-    eye = torch.eye(BLOCK_T)
-
-    T_W = eye + (beta_tiles * K_tiles @ K_tiles.transpose(1, 2)).tril(-1)
-    W = torch.linalg.solve(T_W, beta_tiles * K_tiles).reshape(num_tokens, -1)
-
-    T_U = eye + (beta_tiles * GAMMA * (K_tiles @ K_tiles.transpose(1, 2))).tril(-1)
-    U = torch.linalg.solve(T_U, beta_tiles * V_tiles).reshape(num_tokens, -1)
-
-    # pre-apply gating for q, k, and w
-    Q_scaled = Q * cu_gate.view(-1, 1).exp()
-    K_scaled = K * (-cu_gate).view(-1, 1).exp()
-    W_scaled = W * cu_gate.view(-1, 1).exp()
-
     for t in range(0, num_tokens, BLOCK_T):
-        q_tile = Q_scaled[t : t + BLOCK_T]
-        k_tile = K_scaled[t : t + BLOCK_T]
-        w_tile = W_scaled[t : t + BLOCK_T]
-        u_tile = U[t : t + BLOCK_T]
+        q_tile = Q[t : t + BLOCK_T]
+        k_tile = K[t : t + BLOCK_T]
+        v_tile = V[t : t + BLOCK_T]
 
-        v_err = u_tile - w_tile @ state.T
-        out[t : t + BLOCK_T] = q_tile @ state.T + (q_tile @ k_tile.T * mask) @ v_err
+        g_tile = gate[t : t + BLOCK_T].view(-1, 1)
+        b_tile = beta[t : t + BLOCK_T].view(-1, 1)
+
+        # just follow the equation...
+        cu_gate = g_tile.cumsum(dim=0)
+        GAMMA = (cu_gate - cu_gate.view(1, -1)).exp()  # [BLOCK_T, BLOCK_T]
+
+        kkt = k_tile @ k_tile.T
+        w_tile = torch.linalg.solve(eye + (b_tile * kkt).tril(-1), b_tile * k_tile)
+        u_tile = torch.linalg.solve(eye + (b_tile * GAMMA * kkt).tril(-1), b_tile * v_tile)
+
+        cu_gate = cu_gate.exp()
+        scaled_mask = mask / cu_gate.view(1, -1)
+        v_err = u_tile - cu_gate * (w_tile @ state.T)
+        out[t : t + BLOCK_T] = cu_gate * (q_tile @ state.T + ((q_tile @ k_tile.T) * scaled_mask) @ v_err)
 
         # last element in tile cumsum = tile sum
-        g = cu_gate[t // BLOCK_T, -1].exp()
-        state = g * (state + v_err.T @ k_tile)
+        state = cu_gate[-1] * (state + (v_err / cu_gate).T @ k_tile)
 
     return state, out
 
