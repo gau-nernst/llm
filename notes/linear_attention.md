@@ -224,7 +224,7 @@ S_t = g_t S_{t-1} + \vec k_t^T \vec v_t
 Let's unroll it one more time to observe the pattern.
 
 ```math
-S_t = g_t \left( g_{t-1} S_{t-2} + \vec k_{t-1}^T \vec v_{t-1} \right) + \vec k_t^T \vec v_t
+S_t = g_t \left( g_{t-1} S_{t-2} + \vec k_{t-1}^T \vec v_{t-1}\right) + \vec k_t^T \vec v_t
 ```
 
 ```math
@@ -234,7 +234,7 @@ S_t = g_t \left( g_{t-1} S_{t-2} + \vec k_{t-1}^T \vec v_{t-1} \right) + \vec k_
 Generalizing it ($a \leq b$)
 
 ```math
-S_b = \left(g_b \dots g_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \vec k_t^T \vec v_t
+S_b = \left(g_b \dots g_{a+1}\right) S_a + \sum_{t=a+1}^b \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec v_t
 ```
 
 The cumulative gating factor is a bit annoying, but I suppose it's not the end of the world. Note that the scales vary along the reduction dim, hence we can only pre-apply this scaling to the inputs ($\vec k$ in this case) to convert this to a matmul.
@@ -242,7 +242,7 @@ The cumulative gating factor is a bit annoying, but I suppose it's not the end o
 One note on numerical stability. Multiplying a lot of <1 numbers together is usually not a good idea. We can use the well-known log trick.
 
 ```math
-\prod g_t = \exp \left( \sum \log g_t \right)
+\prod g_t = \exp \left(\sum \log g_t\right)
 ```
 
 Moreover, we can predict $\log g_t$ directly, hence only an extra exponential is involved.
@@ -254,7 +254,7 @@ To compute the output
 ```
 
 ```math
-= \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1}\right) \vec q_b \vec k_t^T \vec v_t
+= \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{t+1}\right) \vec q_b \vec k_t^T \vec v_t
 ```
 
 Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the dot product $\vec q_b \vec k_t^T$ (ignoring the extra scaling).
@@ -262,7 +262,7 @@ Notice that we have replaced the outer product $\vec k_t^T \vec v_t$ with the do
 - For the 2nd term, it's a bit more complicated: the scaling depends on the relative position between query and key vectors - key stays at $t$, and query stays at $b$. We can re-write the output equation as:
 
 ```math
-\vec o_b = \left(g_b \dots g_{a+1} \right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \cdots g_{a+1}\right)} \vec k_t^T \vec v_t
+\vec o_b = \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \vec v_t
 ```
 
 We can either pre-scale queries and keys, OR post-scale `Q @ K.T`. Notice that `Q @ K.T` is doing reduction along the `qk_dim`, so scaling along the `BLOCK_T` dim can be fused at output.
@@ -396,7 +396,7 @@ S_t = g_t H_t S_{t-1} + \beta_t \vec k_t^T \vec v_t
 Generalizing it ($a \leq b$)
 
 ```math
-S_b = \left(g_b \dots g_{a+1} \right) \left(H_b \dots H_{a+1} \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1} \right) \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t
+S_b = \left(g_b \dots g_{a+1}\right) \left(H_b \dots H_{a+1}\right) S_a + \sum_{t=a+1}^b \left(g_b \dots g_{t+1}\right) \left(H_b \dots H_{t+1}\right) \beta_t \vec k_t^T \vec v_t
 ```
 
 Luckily, there are people very good at math and find ways to compute $H_b \dots H_a$ without actually doing repeated matmuls. Assume
@@ -430,17 +430,17 @@ If we let $\vec w_b = \beta_b \left( \vec k_b - \sum_{t=a}^{b-1} \vec k_b \vec k
 We want to prove the following (2nd term in $S_b$ equation), and also find the recurrent relation for $\vec u$
 
 ```math
-\sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t = \sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec u_t
+\sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \left(H_b \dots H_{t+1}\right) \beta_t \vec k_t^T \vec v_t = \sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec u_t
 ```
 
 At $b=a$, we get $\vec u_a = \beta_a \vec v_a$. Proving the inductive step
 
 ```math
-\sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \left(H_b \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t
+\sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \left(H_b \dots H_{t+1}\right) \beta_t \vec k_t^T \vec v_t
 ```
 
 ```math
-= g_b H_b \sum_{t=a}^{b-1} \left(g_{b-1} \dots g_{t+1}\right) \left(H_{b-1} \dots H_{t+1} \right) \beta_t \vec k_t^T \vec v_t + \beta_b \vec k_b^T \vec v_b
+= g_b H_b \sum_{t=a}^{b-1} \left(g_{b-1} \dots g_{t+1}\right) \left(H_{b-1} \dots H_{t+1}\right) \beta_t \vec k_t^T \vec v_t + \beta_b \vec k_b^T \vec v_b
 ```
 
 ```math
@@ -456,25 +456,25 @@ Hence, by setting $\vec u_b = \beta_b \left(\vec v_b - \sum_{t=a}^{b-1} \left(g_
 Putting everything back to the state update equation.
 
 ```math
-S_b = \left(g_b \dots g_{a+1}\right) \left(I - \sum_{t=a+1}^b \vec k_t^T \vec w_t \right) S_a + \sum_{t=a+1}^b \left(g_b \cdots g_{t+1}\right) \vec k_t^T \vec u_t
+S_b = \left(g_b \dots g_{a+1}\right) \left(I - \sum_{t=a+1}^b \vec k_t^T \vec w_t\right) S_a + \sum_{t=a+1}^b \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec u_t
 ```
 
 Rewritting this a bit for parallel computations
 
 ```math
-S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \left(\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a\right)\right]
+S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \left(\frac{1}{g_t \dots g_{a+1}}\right) \vec k_t^T \left(\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a\right)\right]
 ```
 
 Notice that this looks very similar to GLA's equations, with $\vec v_t$ being replaced with $\vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a$. Hence, we can define this expression as $\vec v_t' = \vec u_t - \left(g_t \dots g_{a+1}\right)\vec w_t S_a$
 
 ```math
-S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \vec v_t'\right]
+S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \left(\frac{1}{g_t \dots g_{a+1}}\right) \vec k_t^T \vec v_t'\right]
 ```
 
 For the output:
 
 ```math
-\vec o_b = \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{a+1}\right) \vec q_b \frac{1}{\left(g_t \dots g_{a+1}\right)} \vec k_t^T \vec v_t'
+\vec o_b = \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{a+1}\right) \vec q_b \left(\frac{1}{g_t \dots g_{a+1}}\right) \vec k_t^T \vec v_t'
 ```
 
 Similar to GLA, we can either pre-scale the inputs, or post-scale MMA outputs. Looking at the matrix form of input pre-scaling approach.
@@ -516,6 +516,64 @@ U = T_U @ (B * V)
 Size of `T_W` and `T_U` is `[BLOCK_T, BLOCK_T]`, so with sufficiently small `BLOCK_T`, calculting the inverse might not be too slow? [FLA repo](https://github.com/fla-org/flash-linear-attention/blob/v0.4.1/fla/ops/gated_delta_rule/chunk.py#L27) uses `BLOCK_T=64`.
 
 `Gamma` is a `[BLOCK_T, BLOCK_T]` matrix that encodes cumulative product of gate scales. It's defined as `Gamma[i,j] = cumprod(g[:i]) / cumprod(g[:j])`.
+
+There is a problem with this: we need to compute 2 separate matrix inverses for $\vec w$ and $\vec u$! Turns out, we can rewrite the recursive relation for $\vec w$ so that it follows the similar form as $\vec u$, hence sharing the same inverse. The new equation we need to prove:
+
+```math
+\left(g_b \dots g_a\right) \left(H_b \dots H_a\right) = \left(g_b \dots g_a\right) I - \sum_{t=a}^b \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec w_t
+```
+
+At $b=a$, we get $\vec w_a = g_a \beta_a \vec k_a$. Next, proving the inductive step:
+
+```math
+\left(g_b \dots g_a\right) \left(H_b \dots H_a\right)
+```
+
+```math
+= g_b \left(I - \beta_b \vec k_b^T \vec k_b\right) \left[\left(g_{b-1} \dots g_a\right) I - \sum_{t=a}^{b-1} \left(g_{b-1} \dots g_{t+1}\right) \vec k_t^T \vec w_t\right]
+```
+
+```math
+= \left(I - \beta_b \vec k_b^T \vec k_b\right) \left[\left(g_b \dots g_a\right) I - \sum_{t=a}^{b-1} \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec w_t\right]
+```
+
+```math
+= \left(g_b \dots g_a\right) I - \sum_{t=a}^{b-1} \left(g_b \dots g_{t+1}\right) \vec k_t^T \vec w_t - \vec k_b^T \beta_b \left[\left(g_b \dots g_a\right) \vec k_b - \sum_{t=a}^{b-1} \left(g_b \dots g_{t+1}\right) \vec k_b \vec k_t^T \vec w_t\right]
+```
+
+The equations look a lot more complicated, but then we can set
+
+```math
+\vec w_b = \beta_b \left[\left(g_b \dots g_a\right) \vec k_b - \sum_{t=a}^{b-1} \left(g_b \dots g_{t+1}\right) \vec k_b \vec k_t^T \vec w_t\right]
+```
+
+Examining the state update and output equations again
+
+```math
+\vec v_t' = \vec u_t - \vec w_t S_a
+```
+
+```math
+S_b = \left(g_b \dots g_{a+1}\right) \left[S_a + \sum_{t=a+1}^b \left(\frac{1}{g_t \dots g_{a+1}}\right) \vec k_t^T \vec v_t'\right]
+```
+
+```math
+\vec o_b = \left(g_b \dots g_{a+1}\right) \vec q_b S_a + \sum_{t=a+1}^b \left(g_b \dots g_{a+1}\right) \vec q_b \left(\frac{1}{g_t \dots g_{a+1}}\right) \vec k_t^T \vec v_t'
+```
+
+Matrix notation
+
+```
+T = (I + strictLower(B * Gamma (K @ K.T)))^(-1)
+W = T @ (B * G * K)
+U = T @ (B * V)
+
+V' = U - W @ S
+M' = (1/G) * M
+
+S = G[-1] * (S + K.T @ ((1/G) * V'))
+O = G * (Q @ S + ((Q @ K.T) * M') @ V')
+```
 
 <details>
 <summary>Tile implementation in PyTorch</summary>
@@ -577,14 +635,15 @@ def gdn_parallel(
         # just follow the equation...
         cu_gate = g_tile.cumsum(dim=0)
         GAMMA = (cu_gate - cu_gate.view(1, -1)).exp()  # [BLOCK_T, BLOCK_T]
-
-        kkt = k_tile @ k_tile.T
-        w_tile = torch.linalg.solve(eye + (b_tile * kkt).tril(-1), b_tile * k_tile)
-        u_tile = torch.linalg.solve(eye + (b_tile * GAMMA * kkt).tril(-1), b_tile * v_tile)
-
         cu_gate = cu_gate.exp()
+
+        gamma_b_kkt = b_tile * GAMMA * (k_tile @ k_tile.T)
+        T = torch.linalg.inv(eye + gamma_b_kkt.tril(-1)) * b_tile.view(1, -1)
+        w_tile = T @ (cu_gate * k_tile)
+        u_tile = T @ v_tile
+
         scaled_mask = mask / cu_gate.view(1, -1)
-        v_err = u_tile - cu_gate * (w_tile @ state.T)
+        v_err = u_tile - w_tile @ state.T
         out[t : t + BLOCK_T] = cu_gate * (q_tile @ state.T + ((q_tile @ k_tile.T) * scaled_mask) @ v_err)
 
         # last element in tile cumsum = tile sum
