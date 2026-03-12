@@ -637,8 +637,8 @@ def gdn_parallel(
         GAMMA = (cu_gate - cu_gate.view(1, -1)).exp()  # [BLOCK_T, BLOCK_T]
         cu_gate = cu_gate.exp()
 
-        gamma_b_kkt = b_tile * GAMMA * (k_tile @ k_tile.T)
-        T = torch.linalg.inv(eye + gamma_b_kkt.tril(-1)) * b_tile.view(1, -1)
+        b_gamma_kkt = b_tile * GAMMA * (k_tile @ k_tile.T)
+        T = torch.linalg.inv(eye + b_gamma_kkt.tril(-1)) * b_tile.view(1, -1)
         w_tile = T @ (cu_gate * k_tile)
         u_tile = T @ v_tile
 
