@@ -639,7 +639,7 @@ def gdn_parallel(
 
         b_gamma_kkt = b_tile * GAMMA * (k_tile @ k_tile.T)
         T = torch.linalg.inv(eye + b_gamma_kkt.tril(-1)) * b_tile.view(1, -1)
-        w_tile = T @ (cu_gate * k_tile)
+        w_tile = (T * cu_gate.view(1, -1)) @ k_tile
         u_tile = T @ v_tile
 
         scaled_mask = mask / cu_gate.view(1, -1)
